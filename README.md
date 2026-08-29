@@ -14,7 +14,17 @@ The initial version will run as a normal service deployed alongside applications
 
 ## Status
 
-Repository skeleton only. No CDC, network API, storage, or SDK behavior is implemented yet.
+The v0 contract and a local PostgreSQL logical-replication environment are in place. CDC, the network API, storage, and SDK behavior are not implemented yet.
+
+## Local development
+
+Start the local PostgreSQL source with:
+
+```bash
+make postgres-up
+```
+
+It listens on `127.0.0.1:54329` and is configured for logical replication. See [the local source guide](testing/postgres/README.md) for credentials and reset instructions.
 
 ## Intended layout
 
