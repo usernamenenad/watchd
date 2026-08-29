@@ -27,4 +27,4 @@ Repository skeleton only. No CDC, network API, storage, or SDK behavior is imple
 - `tests/` — integration and fault-test suites
 - `examples/` — runnable reference setups
 
-See [the roadmap](docs/roadmap.md) and [initial semantics](docs/semantics.md).
+See [the roadmap](docs/roadmap.md) and the [v0 semantics contract](docs/semantics.md).
