@@ -1,5 +1,7 @@
-// Package cdc contains source-specific change-data-capture adapters.
+// Package cdc captures committed PostgreSQL changes for watchd.
 //
-// The PostgreSQL adapter is introduced incrementally, beginning with the
-// snapshot-to-logical-stream bootstrap integration test.
+// It owns a logical-replication connection, converts pgoutput protocol
+// messages into committed Transaction batches, and will eventually coordinate
+// source snapshots and replication-slot acknowledgements. It deliberately does
+// not expose a network API or manage consumer subscriptions.
 package cdc
