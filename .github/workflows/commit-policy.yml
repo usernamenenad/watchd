@@ -1,0 +1,45 @@
+name: Commit policy
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - develop
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Determine commit range
+        id: range
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            revision_range="$BASE_SHA..$HEAD_SHA"
+          elif [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+            revision_range="$AFTER_SHA^!"
+          else
+            revision_range="$BEFORE_SHA..$AFTER_SHA"
+          fi
+          echo "revision_range=$revision_range" >> "$GITHUB_OUTPUT"
+
+      - name: Validate sign-offs and issue references
+        env:
+          REVISION_RANGE: ${{ steps.range.outputs.revision_range }}
+        run: ./scripts/check-commit-messages.sh "$REVISION_RANGE"

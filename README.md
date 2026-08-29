@@ -1,5 +1,7 @@
 # watchd
 
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 `watchd` will help services maintain recoverable, verifiably fresh projections of selected PostgreSQL state.
 
 It is deliberately not a task queue or a general-purpose event log. Its intended contract is that a client either knows its projection is complete through a source cursor, or it is explicitly stale and resynchronizes from the source of truth.
@@ -14,7 +16,7 @@ The initial version will run as a normal service deployed alongside applications
 
 ## Status
 
-The v0 contract and a local PostgreSQL logical-replication environment are in place. CDC, the network API, storage, and SDK behavior are not implemented yet.
+`watchd` is pre-alpha. The v0 contract, local PostgreSQL logical-replication environment, connection layer, transaction decoder, and bootstrap integration spike are in place. The watch runtime, network API, and SDK are not implemented, and no production release is available. APIs and configuration may change without compatibility guarantees.
 
 ## Local development
 
@@ -38,3 +40,9 @@ It listens on `127.0.0.1:54329` and is configured for logical replication. See [
 - `examples/` — runnable reference setups
 
 See [the roadmap](docs/roadmap.md) and the [v0 semantics contract](docs/semantics.md).
+
+## Contributing
+
+Contributions are welcome. Start with the [architecture tour](docs/architecture.md), read [CONTRIBUTING.md](CONTRIBUTING.md), and choose a scoped [GitHub issue](https://github.com/usernamenenad/watchd/issues). Every commit must be signed off under the [DCO](DCO) and reference an issue.
+
+The project is licensed under [Apache-2.0](LICENSE). See [SECURITY.md](SECURITY.md) for private vulnerability reporting and [SUPPORT.md](SUPPORT.md) for current support expectations.
