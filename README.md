@@ -16,7 +16,7 @@ The initial version will run as a normal service deployed alongside applications
 
 ## Status
 
-`watchd` is pre-alpha. The v0 contract, local PostgreSQL logical-replication environment, connection layer, transaction decoder, and bootstrap integration spike are in place. The watch runtime, network API, and SDK are not implemented, and no production release is available. APIs and configuration may change without compatibility guarantees.
+`watchd` is pre-alpha. The v0 contract, local PostgreSQL logical-replication environment, resilient transaction reader, and bootstrap integration spike are in place. An explicit provisioning step creates or validates a replication slot; the reader then emits only committed transaction batches, acknowledges only locally accepted batches, and reconnects after transient connection loss without recreating a missing slot. The watch runtime, network API, SDK, snapshot coordination, and production release are not implemented. APIs and configuration may change without compatibility guarantees.
 
 ## Local development
 

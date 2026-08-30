@@ -14,10 +14,11 @@ CREATE TABLE tenant_permissions_projection (
 
 ALTER TABLE tenant_permissions_projection REPLICA IDENTITY DEFAULT;
 
-CREATE PUBLICATION watchd_publication FOR TABLE tenant_permissions_projection;
+CREATE PUBLICATION watchd_publication
+    FOR TABLE tenant_permissions_projection
+    WITH (publish = 'insert, update, delete');
 
 GRANT CONNECT ON DATABASE watchd TO watchd_app, watchd_replicator;
 GRANT USAGE ON SCHEMA public TO watchd_app, watchd_replicator;
 GRANT SELECT, INSERT, UPDATE, DELETE ON tenant_permissions_projection TO watchd_app;
 GRANT SELECT ON tenant_permissions_projection TO watchd_replicator;
-

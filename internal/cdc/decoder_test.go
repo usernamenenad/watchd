@@ -71,6 +71,41 @@ func TestDecoderPreservesUpdateAndDeleteInOneTransaction(t *testing.T) {
 	}
 }
 
+func TestDecoderDerivesDeleteKeyFromFullOldTuple(t *testing.T) {
+	decoder := NewDecoder()
+	relation := sampleRelation()
+	mustConsume(t, decoder, relation)
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+	mustConsume(t, decoder, &pglogrepl.DeleteMessage{
+		RelationID: relation.RelationID,
+		OldTuple:   fullTuple("acme", "alice", "editor"),
+	})
+
+	transaction, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 44})
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got, want := transaction.Changes[0].Key, map[string]string{"tenant_id": "acme", "user_id": "alice"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("delete key = %#v, want %#v", got, want)
+	}
+}
+
+func TestDecoderRejectsPrimaryKeyUpdate(t *testing.T) {
+	decoder := NewDecoder()
+	relation := sampleRelation()
+	mustConsume(t, decoder, relation)
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+
+	_, err := decoder.Consume(&pglogrepl.UpdateMessage{
+		RelationID: relation.RelationID,
+		OldTuple:   keyTuple("acme", "alice"),
+		NewTuple:   fullTuple("acme", "bob", "editor"),
+	})
+	if !errors.Is(err, ErrPrimaryKeyChangeUnsupported) {
+		t.Fatalf("error = %v, want %v", err, ErrPrimaryKeyChangeUnsupported)
+	}
+}
+
 func TestDecoderRejectsRowChangesOutsideTransaction(t *testing.T) {
 	decoder := NewDecoder()
 	relation := sampleRelation()
@@ -87,8 +122,50 @@ func TestDecoderRejectsUnknownRelation(t *testing.T) {
 	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
 
 	_, err := decoder.Consume(&pglogrepl.InsertMessage{RelationID: 999, Tuple: fullTuple("acme", "alice", "editor")})
-	if err == nil || err.Error() != "cdc: row change references unknown relation ID 999" {
+	if !errors.Is(err, ErrUnknownRelation) {
+		t.Fatalf("error = %v, want %v", err, ErrUnknownRelation)
+	}
+	if err.Error() != "cdc: row change references unknown relation ID 999" {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestDecoderRejectsUnsupportedProjectionMutation(t *testing.T) {
+	decoder := NewDecoder()
+
+	_, err := decoder.Consume(&pglogrepl.TruncateMessage{})
+	if !errors.Is(err, ErrUnsupportedPGOutputMessage) {
+		t.Fatalf("error = %v, want %v", err, ErrUnsupportedPGOutputMessage)
+	}
+}
+
+func TestDecoderEnforcesTransactionLimits(t *testing.T) {
+	decoder := NewDecoderWithLimits(1024, 1)
+	relation := sampleRelation()
+	mustConsume(t, decoder, relation)
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+	mustConsume(t, decoder, &pglogrepl.InsertMessage{
+		RelationID: relation.RelationID,
+		Tuple:      fullTuple("acme", "alice", "editor"),
+	})
+
+	_, err := decoder.Consume(&pglogrepl.InsertMessage{
+		RelationID: relation.RelationID,
+		Tuple:      fullTuple("acme", "bob", "viewer"),
+	})
+	if !errors.Is(err, ErrTransactionTooManyChanges) {
+		t.Fatalf("error = %v, want %v", err, ErrTransactionTooManyChanges)
+	}
+
+	tooSmall := NewDecoderWithLimits(1, 10)
+	mustConsume(t, tooSmall, relation)
+	mustConsume(t, tooSmall, &pglogrepl.BeginMessage{})
+	_, err = tooSmall.Consume(&pglogrepl.InsertMessage{
+		RelationID: relation.RelationID,
+		Tuple:      fullTuple("acme", "alice", "editor"),
+	})
+	if !errors.Is(err, ErrTransactionTooLarge) {
+		t.Fatalf("error = %v, want %v", err, ErrTransactionTooLarge)
 	}
 }
 

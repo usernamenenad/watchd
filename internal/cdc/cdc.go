@@ -8,7 +8,10 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-var ErrDatabaseURLRequired = errors.New("cdc: database URL is required")
+var (
+	ErrDatabaseURLRequired = errors.New("cdc: database URL is required")
+	ErrInvalidDatabaseURL  = errors.New("cdc: invalid PostgreSQL database URL")
+)
 
 // CDC owns watchd's logical-replication connection to one PostgreSQL source.
 //
@@ -32,7 +35,8 @@ func Connect(ctx context.Context, databaseURL string) (*CDC, error) {
 
 	config, err := pgconn.ParseConfig(databaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("cdc: parse PostgreSQL connection URL: %w", err)
+		// Do not wrap the parser error: malformed URLs may contain a password.
+		return nil, ErrInvalidDatabaseURL
 	}
 	if config.RuntimeParams == nil {
 		config.RuntimeParams = make(map[string]string)
@@ -43,7 +47,10 @@ func Connect(ctx context.Context, databaseURL string) (*CDC, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cdc: connect to PostgreSQL replication endpoint: %w", err)
 	}
-	return &CDC{conn: conn}, nil
+
+	return &CDC{
+		conn: conn,
+	}, nil
 }
 
 // Conn returns the underlying PostgreSQL replication connection. It is
