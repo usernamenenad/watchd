@@ -7,7 +7,7 @@ test:
 	go test ./...
 
 integration:
-	go test -tags=integration ./tests/integration
+	go test -p=1 -tags=integration ./...
 
 commit-policy:
 	@test -n "$(RANGE)" || (echo "usage: make commit-policy RANGE=<git-revision-range>" >&2; exit 2)

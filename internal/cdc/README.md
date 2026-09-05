@@ -2,12 +2,13 @@
 
 This package contains watchd's PostgreSQL logical-decoding adapter.
 
-`Reader` owns one PostgreSQL logical-replication source. Its explicit
-`InitializeSlot` provisioning step creates or validates a persistent
-`pgoutput` slot. `Run` requires that slot to exist, starts protocol version 1
-replication, handles WAL and keepalive messages, decodes committed transaction
-batches, and retries temporary connection failures with bounded exponential
-backoff.
+`Reader` owns one PostgreSQL logical-replication source. `Bootstrap` is the
+only creation path: it creates a new persistent `pgoutput` slot with an
+exported PostgreSQL snapshot, reads one configured projection scope at that
+snapshot, and returns the matching opaque cursor. `Run` consumes the
+already-started bootstrap stream or resumes an existing slot; it handles WAL
+and keepalive messages, decodes committed transaction batches, and retries
+temporary connection failures with bounded exponential backoff.
 
 `Decoder` remembers relation metadata, buffers row mutations between `BEGIN`
 and `COMMIT`, and emits a `Transaction` only after commit. It bounds the
@@ -31,8 +32,8 @@ deliver the transaction again; sinks must therefore be idempotent.
   lag and do not delete or recreate a slot to recover from an invalidation;
   recovery needs a new source snapshot.
 
-Snapshot/slot handoff, the replay buffer, watcher subscriptions, and cursor
-persistence remain outside this package and are tracked by later issues.
+The replay buffer, watcher subscriptions, and consumer cursor persistence
+remain outside this package and are tracked by later issues.
 
 ## Reader setup
 
@@ -46,12 +47,24 @@ if err != nil {
     return err
 }
 
-// Provisioning is explicit so a missing slot during recovery is never silently
-// recreated. This does not replace issue #2's snapshot/slot bootstrap.
-_, err = reader.InitializeSlot(ctx)
+snapshot, err := reader.Bootstrap(ctx, cdc.ProjectionSpec{
+    SourceID:    "primary",
+    Schema:      "public",
+    Table:       "tenant_permissions_projection",
+    ScopeColumn: "tenant_id",
+    PrimaryKey:  []string{"tenant_id", "user_id"},
+}, cdc.Scope{Value: tenantID})
 if err != nil {
+    return err
+}
+if err := installSnapshotAtomically(snapshot); err != nil {
     return err
 }
 
 return reader.Run(ctx)
 ```
+
+`Bootstrap` starts replication on the exact connection and cursor paired with
+the snapshot; `Run` consumes that already-started stream. A later recovery
+with an existing usable slot calls `Run` directly; it never creates a missing
+slot.

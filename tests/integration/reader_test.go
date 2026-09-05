@@ -31,7 +31,7 @@ func TestReaderEmitsAtomicTransactionAndAcknowledges(t *testing.T) {
 		transactions <- transaction
 		return nil
 	})
-	initializeReaderSlot(t, ctx, reader)
+	bootstrapReader(t, ctx, reader)
 
 	runCtx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
@@ -111,7 +111,7 @@ func TestReaderReconnectsAfterReplicationBackendTerminates(t *testing.T) {
 		transactions <- transaction
 		return nil
 	})
-	initializeReaderSlot(t, ctx, reader)
+	bootstrapReader(t, ctx, reader)
 
 	runCtx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
@@ -175,7 +175,7 @@ func TestReaderEmitsUpdateAndDeleteInOneTransaction(t *testing.T) {
 		transactions <- transaction
 		return nil
 	})
-	initializeReaderSlot(t, ctx, reader)
+	bootstrapReader(t, ctx, reader)
 
 	runCtx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
@@ -243,7 +243,7 @@ func TestReaderNeverEmitsAbortedTransaction(t *testing.T) {
 		transactions <- transaction
 		return nil
 	})
-	initializeReaderSlot(t, ctx, reader)
+	bootstrapReader(t, ctx, reader)
 
 	runCtx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
@@ -293,7 +293,7 @@ func TestReaderDoesNotAcknowledgeRejectedTransaction(t *testing.T) {
 	reader := newIntegrationReader(t, slotName, func(context.Context, cdc.Transaction) error {
 		return sinkErr
 	})
-	initializeReaderSlot(t, ctx, reader)
+	bootstrapReader(t, ctx, reader)
 
 	runCtx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
@@ -328,7 +328,7 @@ func TestReaderDoesNotAcknowledgeRejectedTransaction(t *testing.T) {
 	dropSlot(t, ctx, slotName)
 }
 
-func TestReaderRequiresExplicitSlotInitialization(t *testing.T) {
+func TestReaderRequiresBootstrapForNewSlot(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -364,7 +364,7 @@ func TestReaderDoesNotRecreateDeletedSlotDuringReconnect(t *testing.T) {
 		MaxAttempts:    2,
 		Jitter:         0.1,
 	})
-	initializeReaderSlot(t, ctx, reader)
+	bootstrapReader(t, ctx, reader)
 
 	runCtx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
@@ -399,7 +399,7 @@ func TestReaderStopsWithinConfiguredShutdownTimeout(t *testing.T) {
 	slotName := fmt.Sprintf("watchd_shutdown_%d", time.Now().UnixNano())
 	registerSlotCleanup(t, slotName)
 	reader := newIntegrationReader(t, slotName, func(context.Context, cdc.Transaction) error { return nil })
-	initializeReaderSlot(t, ctx, reader)
+	bootstrapReader(t, ctx, reader)
 
 	runCtx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
@@ -450,15 +450,15 @@ func newIntegrationReaderWithRetry(t *testing.T, slotName string, sink cdc.Trans
 	return reader
 }
 
-func initializeReaderSlot(t *testing.T, ctx context.Context, reader *cdc.Reader) {
+func bootstrapReader(t *testing.T, ctx context.Context, reader *cdc.Reader) {
 	t.Helper()
 
-	info, err := reader.InitializeSlot(ctx)
+	snapshot, err := reader.Bootstrap(ctx, integrationProjectionSpec(), cdc.Scope{Value: "00000000-0000-0000-0000-000000000001"})
 	if err != nil {
-		t.Fatalf("initialize replication slot: %v", err)
+		t.Fatalf("bootstrap replication source: %v", err)
 	}
-	if !info.Created || info.ResumeLSN == "" {
-		t.Fatalf("slot initialization = %#v, want a created slot with a consistent LSN", info)
+	if snapshot.Cursor == "" {
+		t.Fatalf("bootstrap snapshot = %#v, want a consistent cursor", snapshot)
 	}
 }
 
