@@ -27,6 +27,30 @@ type Transaction struct {
 	Changes []Change
 }
 
+// ProjectionSpec identifies one configured projection table. It is trusted
+// source configuration, not a client-provided SQL query.
+type ProjectionSpec struct {
+	SourceID    string
+	Schema      string
+	Table       string
+	ScopeColumn string
+	PrimaryKey  []string
+}
+
+// Scope selects one equality-partition of a ProjectionSpec.
+type Scope struct {
+	Value string
+}
+
+// Snapshot is a consistent scoped read paired with the opaque cursor at
+// which replication must resume. Like Change.Values, row values are their
+// PostgreSQL text representation or nil for SQL NULL.
+type Snapshot struct {
+	SourceID string
+	Cursor   string
+	Rows     []map[string]any
+}
+
 // UnchangedToast represents a PostgreSQL TOAST value omitted from an UPDATE
 // message because that column did not change. A projection applier must retain
 // its existing value for that column.

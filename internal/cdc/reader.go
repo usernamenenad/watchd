@@ -45,6 +45,19 @@ var (
 	// ErrPostgresServer indicates that PostgreSQL rejected a replication
 	// operation for a permanent reason not covered by a narrower error.
 	ErrPostgresServer = errors.New("cdc: PostgreSQL rejected replication operation")
+	// ErrSourceUnavailable indicates that watchd could not establish a usable
+	// connection to the configured PostgreSQL source.
+	ErrSourceUnavailable = errors.New("cdc: PostgreSQL source is unavailable")
+	// ErrSnapshotExpired indicates that PostgreSQL no longer recognizes the
+	// exported snapshot paired with a bootstrap cursor.
+	ErrSnapshotExpired = errors.New("cdc: exported snapshot has expired")
+	// ErrInsufficientPrivileges indicates that the configured database role
+	// cannot perform a required bootstrap or replication operation.
+	ErrInsufficientPrivileges = errors.New("cdc: insufficient PostgreSQL privileges")
+	// ErrBootstrapSlotExists indicates that a bootstrap cannot export a new
+	// snapshot because the configured slot already exists. Reusing that slot
+	// would not provide a snapshot paired with its original consistent point.
+	ErrBootstrapSlotExists = errors.New("cdc: bootstrap requires a new replication slot")
 )
 
 const (
@@ -117,15 +130,6 @@ type ReaderStats struct {
 	InFlightChanges      int
 }
 
-// SlotInfo describes a configured logical replication slot after explicit
-// initialization. ResumeLSN is opaque to callers and is intended for source
-// bootstrap coordination; it is not a consumer-facing cursor.
-type SlotInfo struct {
-	Name      string
-	ResumeLSN string
-	Created   bool
-}
-
 // Reader owns the lifecycle of one PostgreSQL logical replication source.
 // It opens connections, streams pgoutput, emits committed batches, and only
 // acknowledges batches after its TransactionSink accepts them.
@@ -142,6 +146,12 @@ type Reader struct {
 
 	statsMu sync.RWMutex
 	stats   ReaderStats
+
+	bootstrapMu     sync.Mutex
+	bootstrapStream *CDC
+	bootstrapLSN    pglogrepl.LSN
+
+	beforeSnapshotRead func(context.Context) error
 }
 
 // NewReader validates configuration and creates a reader. It opens no network
@@ -167,66 +177,83 @@ func NewReader(config ReaderConfig, sink TransactionSink) (*Reader, error) {
 	}, nil
 }
 
-// InitializeSlot explicitly creates the configured logical replication slot
-// when it is absent, or validates and returns an existing slot. It must be run
-// as a source-provisioning step before Run. It does not create a consumer
-// snapshot; issue #2 will pair slot initialization with an exported snapshot.
+// Bootstrap creates a new persistent slot with an exported snapshot, reads
+// the requested scope at that snapshot, and returns the matching resume
+// cursor. The slot retains all changes after Cursor for a later Run call.
 //
-// Run intentionally never calls this method. A missing slot during normal
-// startup or recovery is a source-history loss that must return
-// ErrSlotInvalidated rather than be silently recreated.
-func (r *Reader) InitializeSlot(ctx context.Context) (SlotInfo, error) {
+// Bootstrap deliberately refuses an existing slot: PostgreSQL only exports
+// this snapshot while creating the slot, so an old slot cannot provide the
+// required gap-free boundary.
+func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope) (snapshot Snapshot, err error) {
+	if err := validateProjectionSpecConfig(spec); err != nil {
+		return Snapshot{}, err
+	}
+
 	stream, err := r.connectReplication(ctx)
 	if err != nil {
-		return SlotInfo{}, err
+		return Snapshot{}, err
 	}
-	defer r.closeReplicationConnection(stream)
+	streamTransferred := false
+	defer func() {
+		if !streamTransferred {
+			r.closeReplicationConnection(stream)
+		}
+	}()
 
 	management, err := r.connectManagementWithTimeout(ctx)
 	if err != nil {
-		return SlotInfo{}, err
+		return Snapshot{}, err
 	}
 	defer r.closeManagementConnection(management)
 
 	if err := r.validatePublication(ctx, management); err != nil {
-		return SlotInfo{}, err
+		return Snapshot{}, err
 	}
 
-	slot, found, err := lookupSlot(ctx, management, r.config.SlotName)
+	if err := r.validateProjectionSpec(ctx, management, spec); err != nil {
+		return Snapshot{}, err
+	}
+
+	created, err := r.createBootstrapSlot(ctx, stream, management)
 	if err != nil {
-		return SlotInfo{}, err
+		return Snapshot{}, err
 	}
-	if found {
-		if err := validateSlot(slot); err != nil {
-			return SlotInfo{}, err
+	defer func() {
+		if err == nil {
+			return
 		}
-		return SlotInfo{Name: r.config.SlotName, ResumeLSN: slot.resumeLSN}, nil
+		if cleanupErr := r.dropSlot(stream, r.config.SlotName); cleanupErr != nil {
+			err = fmt.Errorf("%w; clean up bootstrap replication slot: %v", err, cleanupErr)
+		}
+	}()
+
+	if created.snapshotName == "" || created.resumeLSN == "" {
+		return Snapshot{}, fmt.Errorf("%w: PostgreSQL did not return an exported snapshot and consistent point", ErrPostgresServer)
 	}
 
-	created, err := pglogrepl.CreateReplicationSlot(ctx, stream.Conn(), r.config.SlotName, "pgoutput", pglogrepl.CreateReplicationSlotOptions{})
+	rows, err := readSnapshot(ctx, management, spec, scope, created.snapshotName, r.config.ShutdownTimeout, r.beforeSnapshotRead)
 	if err != nil {
-		// Another initializer may have created the slot after our lookup. In that
-		// case, inspect the winner's slot rather than treating the race as loss.
-		if !isDuplicateObject(err) {
-			return SlotInfo{}, classifyPostgresError(err)
-		}
-		slot, found, lookupErr := lookupSlot(ctx, management, r.config.SlotName)
-		if lookupErr != nil {
-			return SlotInfo{}, lookupErr
-		}
-		if !found {
-			return SlotInfo{}, classifyPostgresError(err)
-		}
-		if err := validateSlot(slot); err != nil {
-			return SlotInfo{}, err
-		}
-		return SlotInfo{Name: r.config.SlotName, ResumeLSN: slot.resumeLSN}, nil
+		return Snapshot{}, err
+	}
+	startLSN, err := pglogrepl.ParseLSN(created.resumeLSN)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("%w: invalid bootstrap consistent point", ErrPostgresServer)
+	}
+	if err := r.startReplication(ctx, stream.Conn(), startLSN); err != nil {
+		return Snapshot{}, err
 	}
 
-	return SlotInfo{
-		Name:      r.config.SlotName,
-		ResumeLSN: created.ConsistentPoint,
-		Created:   true,
+	r.bootstrapMu.Lock()
+	r.bootstrapStream = stream
+	r.bootstrapLSN = startLSN
+	r.bootstrapMu.Unlock()
+	streamTransferred = true
+	r.setConnectionState("streaming")
+
+	return Snapshot{
+		SourceID: spec.SourceID,
+		Cursor:   created.resumeLSN,
+		Rows:     rows,
 	}, nil
 }
 
@@ -273,6 +300,13 @@ func (r *Reader) Run(ctx context.Context) error {
 // read owns exactly one PostgreSQL replication connection. A retryable return
 // value is handled by Run, which creates a new connection and decoder.
 func (r *Reader) read(ctx context.Context) error {
+	if stream, startLSN, ok := r.takeBootstrapStream(); ok {
+		defer r.closeReplicationConnection(stream)
+		r.setConnectionState("streaming")
+		decoder := NewDecoderWithLimits(r.config.MaxTransactionBytes, r.config.MaxTransactionChanges)
+		return r.receive(ctx, stream.Conn(), decoder, startLSN)
+	}
+
 	stream, err := r.connectReplication(ctx)
 	if err != nil {
 		return err
@@ -285,7 +319,18 @@ func (r *Reader) read(ctx context.Context) error {
 		return err
 	}
 
-	err = pglogrepl.StartReplication(
+	if err := r.startReplication(ctx, conn, startLSN); err != nil {
+		return err
+	}
+
+	r.log(ctx, slog.LevelInfo, "PostgreSQL logical replication started", "slot", r.config.SlotName, "start_lsn", startLSN.String())
+	r.setConnectionState("streaming")
+	decoder := NewDecoderWithLimits(r.config.MaxTransactionBytes, r.config.MaxTransactionChanges)
+	return r.receive(ctx, conn, decoder, startLSN)
+}
+
+func (r *Reader) startReplication(ctx context.Context, conn *pgconn.PgConn, startLSN pglogrepl.LSN) error {
+	err := pglogrepl.StartReplication(
 		ctx,
 		conn,
 		r.config.SlotName,
@@ -299,11 +344,20 @@ func (r *Reader) read(ctx context.Context) error {
 	if err != nil {
 		return classifyPostgresError(err)
 	}
+	return nil
+}
 
-	r.log(ctx, slog.LevelInfo, "PostgreSQL logical replication started", "slot", r.config.SlotName, "start_lsn", startLSN.String())
-	r.setConnectionState("streaming")
-	decoder := NewDecoderWithLimits(r.config.MaxTransactionBytes, r.config.MaxTransactionChanges)
-	return r.receive(ctx, conn, decoder, startLSN)
+func (r *Reader) takeBootstrapStream() (*CDC, pglogrepl.LSN, bool) {
+	r.bootstrapMu.Lock()
+	defer r.bootstrapMu.Unlock()
+	if r.bootstrapStream == nil {
+		return nil, 0, false
+	}
+	stream := r.bootstrapStream
+	startLSN := r.bootstrapLSN
+	r.bootstrapStream = nil
+	r.bootstrapLSN = 0
+	return stream, startLSN, true
 }
 
 func (r *Reader) receive(ctx context.Context, conn *pgconn.PgConn, decoder *Decoder, initialLSN pglogrepl.LSN) error {
@@ -461,11 +515,11 @@ func (r *Reader) requireSlot(ctx context.Context) (pglogrepl.LSN, error) {
 }
 
 func (r *Reader) validatePublication(ctx context.Context, management *pgx.Conn) error {
-	var publishesTruncate bool
+	var publishesInsert, publishesUpdate, publishesDelete, publishesTruncate bool
 	err := management.QueryRow(ctx, `
-		SELECT pubtruncate
+		SELECT pubinsert, pubupdate, pubdelete, pubtruncate
 		FROM pg_publication
-		WHERE pubname = $1`, r.config.PublicationName).Scan(&publishesTruncate)
+		WHERE pubname = $1`, r.config.PublicationName).Scan(&publishesInsert, &publishesUpdate, &publishesDelete, &publishesTruncate)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("%w: publication %q does not exist", ErrInvalidReaderConfig, r.config.PublicationName)
 	}
@@ -475,7 +529,253 @@ func (r *Reader) validatePublication(ctx context.Context, management *pgx.Conn) 
 	if publishesTruncate {
 		return fmt.Errorf("%w: publication %q publishes TRUNCATE, which v0 does not support", ErrInvalidReaderConfig, r.config.PublicationName)
 	}
+	if !publishesInsert || !publishesUpdate || !publishesDelete {
+		return fmt.Errorf("%w: publication %q must publish INSERT, UPDATE, and DELETE", ErrInvalidReaderConfig, r.config.PublicationName)
+	}
 	return nil
+}
+
+func (r *Reader) validateProjectionSpec(ctx context.Context, management *pgx.Conn, spec ProjectionSpec) error {
+	qualifiedTable := pgx.Identifier{spec.Schema, spec.Table}.Sanitize()
+	var tableExists, scopeColumnExists bool
+	err := management.QueryRow(ctx, `
+		WITH projection AS (
+			SELECT oid
+			FROM pg_class
+			WHERE oid = to_regclass($1)
+			  AND relkind IN ('r', 'p')
+		)
+		SELECT
+			EXISTS (SELECT 1 FROM projection),
+			EXISTS (
+				SELECT 1
+				FROM pg_attribute
+				WHERE attrelid = (SELECT oid FROM projection)
+				  AND attname = $2
+				  AND attnum > 0
+				  AND NOT attisdropped
+			)`, qualifiedTable, spec.ScopeColumn).Scan(&tableExists, &scopeColumnExists)
+	if err != nil {
+		return classifyPostgresError(err)
+	}
+	if !tableExists {
+		return fmt.Errorf("%w: projection table %q.%q does not exist", ErrInvalidReaderConfig, spec.Schema, spec.Table)
+	}
+	if !scopeColumnExists {
+		return fmt.Errorf("%w: projection table %q.%q has no scope column %q", ErrInvalidReaderConfig, spec.Schema, spec.Table, spec.ScopeColumn)
+	}
+
+	primaryKey, err := projectionPrimaryKey(ctx, management, qualifiedTable)
+	if err != nil {
+		return err
+	}
+	if !sameStrings(primaryKey, spec.PrimaryKey) {
+		return fmt.Errorf("%w: projection table %q.%q primary key does not match configured primary key", ErrInvalidReaderConfig, spec.Schema, spec.Table)
+	}
+
+	var published bool
+	err = management.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_publication_tables
+			WHERE pubname = $1
+			  AND schemaname = $2
+			  AND tablename = $3
+		)`, r.config.PublicationName, spec.Schema, spec.Table).Scan(&published)
+	if err != nil {
+		return classifyPostgresError(err)
+	}
+	if !published {
+		return fmt.Errorf("%w: publication %q does not include projection table %q.%q", ErrInvalidReaderConfig, r.config.PublicationName, spec.Schema, spec.Table)
+	}
+
+	return nil
+}
+
+func validateProjectionSpecConfig(spec ProjectionSpec) error {
+	if spec.SourceID == "" || spec.Schema == "" || spec.Table == "" || spec.ScopeColumn == "" || len(spec.PrimaryKey) == 0 {
+		return ErrInvalidReaderConfig
+	}
+	if !postgresIdentifier.MatchString(spec.Schema) || !postgresIdentifier.MatchString(spec.Table) || !postgresIdentifier.MatchString(spec.ScopeColumn) {
+		return fmt.Errorf("%w: projection schema, table, and scope column must be unquoted PostgreSQL identifiers", ErrInvalidReaderConfig)
+	}
+	seen := make(map[string]struct{}, len(spec.PrimaryKey))
+	for _, column := range spec.PrimaryKey {
+		if !postgresIdentifier.MatchString(column) || column == "" {
+			return fmt.Errorf("%w: projection primary-key columns must be unquoted PostgreSQL identifiers", ErrInvalidReaderConfig)
+		}
+		if _, duplicate := seen[column]; duplicate {
+			return fmt.Errorf("%w: projection primary key contains duplicate column %q", ErrInvalidReaderConfig, column)
+		}
+		seen[column] = struct{}{}
+	}
+	return nil
+}
+
+func projectionPrimaryKey(ctx context.Context, management *pgx.Conn, qualifiedTable string) ([]string, error) {
+	rows, err := management.Query(ctx, `
+		SELECT attribute.attname
+		FROM pg_index AS index
+		JOIN LATERAL unnest(index.indkey) WITH ORDINALITY AS key(attnum, position) ON true
+		JOIN pg_attribute AS attribute ON attribute.attrelid = index.indrelid AND attribute.attnum = key.attnum
+		WHERE index.indrelid = to_regclass($1)
+		  AND index.indisprimary
+		ORDER BY key.position`, qualifiedTable)
+	if err != nil {
+		return nil, classifyPostgresError(err)
+	}
+	defer rows.Close()
+
+	var primaryKey []string
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			return nil, classifyPostgresError(err)
+		}
+		primaryKey = append(primaryKey, column)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, classifyPostgresError(err)
+	}
+	if len(primaryKey) == 0 {
+		return nil, fmt.Errorf("%w: projection table %s has no primary key", ErrInvalidReaderConfig, qualifiedTable)
+	}
+	return primaryKey, nil
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+type slotCreation struct {
+	resumeLSN    string
+	snapshotName string
+}
+
+// createBootstrapSlot creates the only safe initial source boundary: a new
+// persistent slot paired with PostgreSQL's exported snapshot.
+func (r *Reader) createBootstrapSlot(ctx context.Context, stream *CDC, management *pgx.Conn) (slotCreation, error) {
+	_, found, err := lookupSlot(ctx, management, r.config.SlotName)
+	if err != nil {
+		return slotCreation{}, err
+	}
+	if found {
+		return slotCreation{}, ErrBootstrapSlotExists
+	}
+
+	created, err := pglogrepl.CreateReplicationSlot(ctx, stream.Conn(), r.config.SlotName, "pgoutput", pglogrepl.CreateReplicationSlotOptions{
+		SnapshotAction: "EXPORT_SNAPSHOT",
+	})
+	if err != nil {
+		// A concurrent bootstrap may win after our lookup, but its exported
+		// snapshot belongs to that operation and cannot be reused here.
+		if isDuplicateObject(err) {
+			return slotCreation{}, ErrBootstrapSlotExists
+		}
+		return slotCreation{}, classifyPostgresError(err)
+	}
+
+	return slotCreation{
+		resumeLSN:    created.ConsistentPoint,
+		snapshotName: created.SnapshotName,
+	}, nil
+}
+
+func (r *Reader) dropSlot(stream *CDC, slotName string) error {
+	// Closing first releases a slot that entered COPY mode immediately before
+	// a bootstrap error or cancellation was observed locally.
+	r.closeReplicationConnection(stream)
+
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), r.config.ShutdownTimeout)
+	defer cancel()
+	cleanupStream, err := r.connect(cleanupCtx, r.config.DatabaseURL)
+	if err != nil {
+		return classifyConnectionError(err)
+	}
+	defer r.closeReplicationConnection(cleanupStream)
+
+	err = pglogrepl.DropReplicationSlot(cleanupCtx, cleanupStream.Conn(), slotName, pglogrepl.DropReplicationSlotOptions{})
+	if postgresError, ok := errors.AsType[*pgconn.PgError](err); ok && postgresError.SQLState() == "42704" {
+		return nil
+	}
+	return classifyPostgresError(err)
+}
+
+func readSnapshot(
+	ctx context.Context,
+	conn *pgx.Conn,
+	spec ProjectionSpec,
+	scope Scope,
+	snapshotName string,
+	cleanupTimeout time.Duration,
+	beforeRead func(context.Context) error,
+) ([]map[string]any, error) {
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, classifyPostgresError(err)
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
+		_ = tx.Rollback(cleanupCtx)
+	}()
+
+	if _, err := tx.Exec(ctx, "SET TRANSACTION SNAPSHOT "+quoteLiteral(snapshotName)); err != nil {
+		return nil, classifySnapshotError(err)
+	}
+	if beforeRead != nil {
+		if err := beforeRead(ctx); err != nil {
+			return nil, err
+		}
+	}
+
+	tableName := pgx.Identifier{spec.Schema, spec.Table}.Sanitize()
+	scopeColumn := pgx.Identifier{spec.ScopeColumn}.Sanitize()
+	rows, err := tx.Query(
+		ctx,
+		fmt.Sprintf("SELECT * FROM %s WHERE %s = $1", tableName, scopeColumn),
+		pgx.QueryResultFormats{pgx.TextFormatCode},
+		scope.Value,
+	)
+	if err != nil {
+		return nil, classifyPostgresError(err)
+	}
+	defer rows.Close()
+
+	fields := rows.FieldDescriptions()
+	snapshotRows := make([]map[string]any, 0)
+	for rows.Next() {
+		values := rows.RawValues()
+		row := make(map[string]any, len(fields))
+		for index, field := range fields {
+			if values[index] == nil {
+				row[field.Name] = nil
+				continue
+			}
+			row[field.Name] = string(values[index])
+		}
+		snapshotRows = append(snapshotRows, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, classifyPostgresError(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, classifyPostgresError(err)
+	}
+
+	return snapshotRows, nil
+}
+
+func quoteLiteral(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 type slotState struct {
@@ -541,14 +841,28 @@ func (r *Reader) connectReplication(ctx context.Context) (*CDC, error) {
 	connectCtx, cancel := context.WithTimeout(ctx, r.config.ConnectionTimeout)
 	defer cancel()
 
-	return r.connect(connectCtx, r.config.DatabaseURL)
+	stream, err := r.connect(connectCtx, r.config.DatabaseURL)
+	if err == nil {
+		return stream, nil
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return nil, classifyConnectionError(err)
 }
 
 func (r *Reader) connectManagementWithTimeout(ctx context.Context) (*pgx.Conn, error) {
 	connectCtx, cancel := context.WithTimeout(ctx, r.config.ConnectionTimeout)
 	defer cancel()
 
-	return r.connectManagement(connectCtx, r.config.DatabaseURL)
+	management, err := r.connectManagement(connectCtx, r.config.DatabaseURL)
+	if err == nil {
+		return management, nil
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return nil, classifyConnectionError(err)
 }
 
 func (r *Reader) acknowledge(ctx context.Context, conn *pgconn.PgConn, safeLSN pglogrepl.LSN) error {
@@ -678,12 +992,35 @@ func classifyPostgresError(err error) error {
 	return err
 }
 
+func classifyConnectionError(err error) error {
+	if errors.Is(err, ErrInvalidDatabaseURL) || errors.Is(err, ErrDatabaseURLRequired) {
+		return err
+	}
+	classified := classifyPostgresError(err)
+	if errors.Is(classified, ErrInsufficientPrivileges) {
+		return classified
+	}
+	return fmt.Errorf("%w: %v", ErrSourceUnavailable, err)
+}
+
+func classifySnapshotError(err error) error {
+	if postgresError, ok := errors.AsType[*pgconn.PgError](err); ok {
+		switch postgresError.SQLState() {
+		case "22023", "42704": // invalid or no-longer-existing snapshot identifier
+			return terminalError(ErrSnapshotExpired, postgresError.SQLState())
+		}
+	}
+	return classifyPostgresError(err)
+}
+
 func classifySQLState(sqlState, message string) error {
 	if strings.Contains(strings.ToLower(message), "requested wal segment") && strings.Contains(strings.ToLower(message), "removed") {
 		return terminalError(ErrSlotInvalidated, sqlState)
 	}
 
 	switch sqlState {
+	case "42501": // insufficient_privilege
+		return terminalError(ErrInsufficientPrivileges, sqlState)
 	case "42704": // undefined object: slot or publication no longer exists
 		return terminalError(ErrSlotInvalidated, sqlState)
 	case "55006": // object_in_use: another backend owns the slot

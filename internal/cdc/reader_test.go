@@ -46,6 +46,36 @@ func TestNewReaderRejectsUnsafeConfiguration(t *testing.T) {
 	}
 }
 
+func TestBootstrapClassifiesUnavailableSource(t *testing.T) {
+	reader := newUnitReader(t)
+	reader.connect = func(context.Context, string) (*CDC, error) {
+		return nil, errors.New("network unavailable")
+	}
+
+	_, err := reader.Bootstrap(context.Background(), ProjectionSpec{
+		SourceID:    "test-postgres",
+		Schema:      "public",
+		Table:       "projection",
+		ScopeColumn: "tenant_id",
+		PrimaryKey:  []string{"tenant_id", "id"},
+	}, Scope{Value: "tenant-a"})
+	if !errors.Is(err, ErrSourceUnavailable) {
+		t.Fatalf("Bootstrap error = %v, want %v", err, ErrSourceUnavailable)
+	}
+}
+
+func TestPostgresBootstrapErrorsAreTyped(t *testing.T) {
+	permissionError := classifyPostgresError(&pgconn.PgError{Code: "42501"})
+	if !errors.Is(permissionError, ErrInsufficientPrivileges) {
+		t.Fatalf("permission error = %v, want %v", permissionError, ErrInsufficientPrivileges)
+	}
+
+	snapshotError := classifySnapshotError(&pgconn.PgError{Code: "22023"})
+	if !errors.Is(snapshotError, ErrSnapshotExpired) {
+		t.Fatalf("snapshot error = %v, want %v", snapshotError, ErrSnapshotExpired)
+	}
+}
+
 func TestReaderRetryDelayIsBoundedAndJittered(t *testing.T) {
 	reader, err := NewReader(ReaderConfig{
 		DatabaseURL:     "postgres://example.invalid/watchd",

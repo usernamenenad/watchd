@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
+	"github.com/nenad/watchd/internal/cdc"
 )
 
 const (
@@ -91,6 +93,178 @@ func TestBootstrapSnapshotThenStreamsLaterChange(t *testing.T) {
 
 	if !receiveInsert(ctx, replicationConn, streamedTenant, streamedUser) {
 		t.Fatalf("did not receive streamed row %s/%s", streamedTenant, streamedUser)
+	}
+}
+
+func TestReaderBootstrapReturnsScopedSnapshotAndRetainsStream(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	app := connectApplication(t, ctx)
+	defer app.Close(ctx)
+	clearProjection(t, ctx, app)
+
+	tenantID := "00000000-0000-0000-0000-000000000001"
+	if _, err := app.Exec(ctx, `
+		INSERT INTO tenant_permissions_projection (tenant_id, user_id, permissions)
+		VALUES
+			($1, '00000000-0000-0000-0000-000000000101', '{"role":"editor"}'),
+			('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000202', '{"role":"viewer"}')`, tenantID); err != nil {
+		t.Fatalf("seed projection rows: %v", err)
+	}
+
+	slotName := fmt.Sprintf("watchd_bootstrap_reader_%d", time.Now().UnixNano())
+	registerSlotCleanup(t, slotName)
+	transactions := make(chan cdc.Transaction, 1)
+	reader := newIntegrationReader(t, slotName, func(_ context.Context, transaction cdc.Transaction) error {
+		transactions <- transaction
+		return nil
+	})
+
+	snapshot, err := reader.Bootstrap(ctx, cdc.ProjectionSpec{
+		SourceID:    "test-postgres",
+		Schema:      "public",
+		Table:       "tenant_permissions_projection",
+		ScopeColumn: "tenant_id",
+		PrimaryKey:  []string{"tenant_id", "user_id"},
+	}, cdc.Scope{Value: tenantID})
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if snapshot.SourceID != "test-postgres" || snapshot.Cursor == "" {
+		t.Fatalf("snapshot metadata = %#v, want source identity and cursor", snapshot)
+	}
+	if got, want := len(snapshot.Rows), 1; got != want {
+		t.Fatalf("snapshot rows = %d, want %d scoped row", got, want)
+	}
+
+	runCtx, stop := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- reader.Run(runCtx) }()
+	defer func() {
+		stop()
+		if err := <-done; err != nil {
+			t.Errorf("reader run: %v", err)
+		}
+	}()
+
+	streamedUserID := "00000000-0000-0000-0000-000000000103"
+	if _, err := app.Exec(ctx, `
+		INSERT INTO tenant_permissions_projection (tenant_id, user_id, permissions)
+		VALUES ($1, $2, '{"role":"admin"}')`, tenantID, streamedUserID); err != nil {
+		t.Fatalf("insert streamed projection row: %v", err)
+	}
+
+	select {
+	case transaction := <-transactions:
+		if got, want := len(transaction.Changes), 1; got != want {
+			t.Fatalf("streamed changes = %d, want %d", got, want)
+		}
+		if transaction.Changes[0].Operation != cdc.OperationInsert {
+			t.Fatalf("streamed operation = %q, want insert", transaction.Changes[0].Operation)
+		}
+	case err := <-done:
+		t.Fatalf("reader stopped before streaming after bootstrap: %v", err)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for post-snapshot transaction")
+	}
+}
+
+func TestReaderBootstrapRejectsMissingScopeColumnWithoutCreatingSlot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	app := connectApplication(t, ctx)
+	defer app.Close(ctx)
+
+	slotName := fmt.Sprintf("watchd_bootstrap_bad_scope_%d", time.Now().UnixNano())
+	reader := newIntegrationReader(t, slotName, func(context.Context, cdc.Transaction) error { return nil })
+	_, err := reader.Bootstrap(ctx, cdc.ProjectionSpec{
+		SourceID:    "test-postgres",
+		Schema:      "public",
+		Table:       "tenant_permissions_projection",
+		ScopeColumn: "missing_scope_column",
+		PrimaryKey:  []string{"tenant_id", "user_id"},
+	}, cdc.Scope{Value: "irrelevant"})
+	if !errors.Is(err, cdc.ErrInvalidReaderConfig) {
+		t.Fatalf("bootstrap error = %v, want invalid projection configuration", err)
+	}
+	if slotExists(t, ctx, app, slotName) {
+		t.Fatalf("bootstrap created slot %q for invalid projection", slotName)
+	}
+}
+
+func TestReaderBootstrapCleansUpSlotAfterSnapshotQueryFailure(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	app := connectApplication(t, ctx)
+	defer app.Close(ctx)
+
+	slotName := fmt.Sprintf("watchd_bootstrap_query_failure_%d", time.Now().UnixNano())
+	reader := newIntegrationReader(t, slotName, func(context.Context, cdc.Transaction) error { return nil })
+	_, err := reader.Bootstrap(ctx, cdc.ProjectionSpec{
+		SourceID:    "test-postgres",
+		Schema:      "public",
+		Table:       "tenant_permissions_projection",
+		ScopeColumn: "tenant_id",
+		PrimaryKey:  []string{"tenant_id", "user_id"},
+	}, cdc.Scope{Value: "not-a-uuid"})
+	if err == nil {
+		t.Fatal("bootstrap succeeded with an invalid UUID scope")
+	}
+	if slotExists(t, ctx, app, slotName) {
+		t.Fatalf("bootstrap leaked slot %q after snapshot query failure", slotName)
+	}
+}
+
+func TestReaderBootstrapClassifiesInsufficientReplicationPrivilege(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	slotName := fmt.Sprintf("watchd_bootstrap_permission_%d", time.Now().UnixNano())
+	reader, err := cdc.NewReader(cdc.ReaderConfig{
+		DatabaseURL:     envOrDefault("WATCHD_TEST_DATABASE_URL", defaultDatabaseURL),
+		SlotName:        slotName,
+		PublicationName: publicationName,
+	}, func(context.Context, cdc.Transaction) error { return nil })
+	if err != nil {
+		t.Fatalf("new reader: %v", err)
+	}
+
+	_, err = reader.Bootstrap(ctx, integrationProjectionSpec(), cdc.Scope{Value: "00000000-0000-0000-0000-000000000001"})
+	if !errors.Is(err, cdc.ErrInsufficientPrivileges) {
+		t.Fatalf("bootstrap error = %v, want insufficient privileges", err)
+	}
+}
+
+func TestReaderBootstrapRejectsInvalidPublication(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	slotName := fmt.Sprintf("watchd_bootstrap_bad_publication_%d", time.Now().UnixNano())
+	reader, err := cdc.NewReader(cdc.ReaderConfig{
+		DatabaseURL:     envOrDefault("WATCHD_TEST_REPLICATION_URL", defaultReplicationURL),
+		SlotName:        slotName,
+		PublicationName: "missing_publication",
+	}, func(context.Context, cdc.Transaction) error { return nil })
+	if err != nil {
+		t.Fatalf("new reader: %v", err)
+	}
+
+	_, err = reader.Bootstrap(ctx, integrationProjectionSpec(), cdc.Scope{Value: "00000000-0000-0000-0000-000000000001"})
+	if !errors.Is(err, cdc.ErrInvalidReaderConfig) {
+		t.Fatalf("bootstrap error = %v, want invalid configuration", err)
+	}
+}
+
+func integrationProjectionSpec() cdc.ProjectionSpec {
+	return cdc.ProjectionSpec{
+		SourceID:    "test-postgres",
+		Schema:      "public",
+		Table:       "tenant_permissions_projection",
+		ScopeColumn: "tenant_id",
+		PrimaryKey:  []string{"tenant_id", "user_id"},
 	}
 }
 
