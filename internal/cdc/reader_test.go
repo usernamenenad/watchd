@@ -69,11 +69,6 @@ func TestPostgresBootstrapErrorsAreTyped(t *testing.T) {
 	if !errors.Is(permissionError, ErrInsufficientPrivileges) {
 		t.Fatalf("permission error = %v, want %v", permissionError, ErrInsufficientPrivileges)
 	}
-
-	snapshotError := classifySnapshotError(&pgconn.PgError{Code: "22023"})
-	if !errors.Is(snapshotError, ErrSnapshotExpired) {
-		t.Fatalf("snapshot error = %v, want %v", snapshotError, ErrSnapshotExpired)
-	}
 }
 
 func TestReaderRetryDelayIsBoundedAndJittered(t *testing.T) {

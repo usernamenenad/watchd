@@ -48,16 +48,22 @@ var (
 	// ErrSourceUnavailable indicates that watchd could not establish a usable
 	// connection to the configured PostgreSQL source.
 	ErrSourceUnavailable = errors.New("cdc: PostgreSQL source is unavailable")
-	// ErrSnapshotExpired indicates that PostgreSQL no longer recognizes the
-	// exported snapshot paired with a bootstrap cursor.
-	ErrSnapshotExpired = errors.New("cdc: exported snapshot has expired")
 	// ErrInsufficientPrivileges indicates that the configured database role
 	// cannot perform a required bootstrap or replication operation.
 	ErrInsufficientPrivileges = errors.New("cdc: insufficient PostgreSQL privileges")
-	// ErrBootstrapSlotExists indicates that a bootstrap cannot export a new
-	// snapshot because the configured slot already exists. Reusing that slot
-	// would not provide a snapshot paired with its original consistent point.
+	// ErrBootstrapSlotExists indicates that a bootstrap cannot run because the
+	// configured slot already exists. Bootstrap is the only slot-creation
+	// path, so a second bootstrap against the same slot name is a caller
+	// error, not a case to silently reuse.
 	ErrBootstrapSlotExists = errors.New("cdc: bootstrap requires a new replication slot")
+	// ErrSlotNotFound indicates that a per-scope Snapshot was requested
+	// before the reader's replication slot exists. Only Bootstrap creates it.
+	ErrSlotNotFound = errors.New("cdc: replication slot does not exist")
+	// ErrSnapshotWindowClosed indicates that a per-scope snapshot's cursor
+	// fell outside the replication slot's retained replay window before the
+	// snapshot could be paired with it, so resuming from that cursor could
+	// silently skip changes. The caller must take a fresh snapshot.
+	ErrSnapshotWindowClosed = errors.New("cdc: snapshot cursor is outside the replication slot's replay window")
 )
 
 const (
@@ -177,13 +183,93 @@ func NewReader(config ReaderConfig, sink TransactionSink) (*Reader, error) {
 	}, nil
 }
 
-// Bootstrap creates a new persistent slot with an exported snapshot, reads
-// the requested scope at that snapshot, and returns the matching resume
-// cursor. The slot retains all changes after Cursor for a later Run call.
+// Snapshot reads one scope's rows plus a resume cursor, using the reader's
+// existing slot instead of creating one. Unlike Bootstrap, it can be called
+// for any number of scopes, at any time, concurrently with Run and with
+// other Snapshot calls.
 //
-// Bootstrap deliberately refuses an existing slot: PostgreSQL only exports
-// this snapshot while creating the slot, so an old slot cannot provide the
-// required gap-free boundary.
+// Cursor is only safe to resume from if the slot has retained every change
+// after it. Snapshot checks that and returns ErrSnapshotWindowClosed if the
+// slot has already moved past Cursor - the caller should just retry with a
+// fresh snapshot.
+func (r *Reader) Snapshot(ctx context.Context, spec ProjectionSpec, scope Scope) (Snapshot, error) {
+	if err := validateProjectionSpecConfig(spec); err != nil {
+		return Snapshot{}, err
+	}
+
+	management, err := r.connectManagementWithTimeout(ctx)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	defer r.closeManagementConnection(management)
+
+	if err := r.validatePublication(ctx, management); err != nil {
+		return Snapshot{}, err
+	}
+	if err := r.validateProjectionSpec(ctx, management, spec); err != nil {
+		return Snapshot{}, err
+	}
+
+	slot, found, err := lookupSlot(ctx, management, r.config.SlotName)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if !found {
+		return Snapshot{}, ErrSlotNotFound
+	}
+	// Unlike requireSlot, Snapshot does not need the slot to be inactive: it
+	// never takes over the slot's replication connection, so it must work
+	// while Run owns the slot and other Snapshot calls run concurrently.
+	if slot.slotType != "logical" || slot.plugin != "pgoutput" {
+		return Snapshot{}, ErrSlotInvalidated
+	}
+
+	rows, cursor, err := readSnapshot(ctx, management, spec, scope, r.config.ShutdownTimeout, r.beforeSnapshotRead)
+	if err != nil {
+		return Snapshot{}, err
+	}
+
+	if err := r.checkReplayWindow(ctx, management, cursor); err != nil {
+		return Snapshot{}, err
+	}
+
+	return Snapshot{
+		SourceID: spec.SourceID,
+		Cursor:   cursor.String(),
+		Rows:     rows,
+	}, nil
+}
+
+// checkReplayWindow re-reads the slot's retained boundary after a snapshot
+// read commits and confirms cursor is still at or after it. restart_lsn is
+// the oldest WAL position PostgreSQL still guarantees to retain for the
+// slot; a cursor behind it means changes between the two may already be
+// gone, so resuming from cursor could silently skip them.
+func (r *Reader) checkReplayWindow(ctx context.Context, management *pgx.Conn, cursor pglogrepl.LSN) error {
+	slot, found, err := lookupSlot(ctx, management, r.config.SlotName)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrSlotNotFound
+	}
+	restartLSN, err := parseLSN(slot.restartLSN)
+	if err != nil {
+		return err
+	}
+	if cursor < restartLSN {
+		return ErrSnapshotWindowClosed
+	}
+	return nil
+}
+
+// Bootstrap creates a new persistent slot, reads the requested scope at a
+// snapshot taken right after, and returns the matching resume cursor. The
+// slot retains all changes after Cursor for a later Run call.
+//
+// Bootstrap deliberately refuses an existing slot: reusing one would mean
+// reading against a source history whose starting point this call never
+// established, so it cannot vouch for a gap-free boundary.
 func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope) (snapshot Snapshot, err error) {
 	if err := validateProjectionSpecConfig(spec); err != nil {
 		return Snapshot{}, err
@@ -214,8 +300,7 @@ func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope
 		return Snapshot{}, err
 	}
 
-	created, err := r.createBootstrapSlot(ctx, stream, management)
-	if err != nil {
+	if err := r.createBootstrapSlot(ctx, stream, management); err != nil {
 		return Snapshot{}, err
 	}
 	defer func() {
@@ -227,32 +312,27 @@ func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope
 		}
 	}()
 
-	if created.snapshotName == "" || created.resumeLSN == "" {
-		return Snapshot{}, fmt.Errorf("%w: PostgreSQL did not return an exported snapshot and consistent point", ErrPostgresServer)
-	}
-
-	rows, err := readSnapshot(ctx, management, spec, scope, created.snapshotName, r.config.ShutdownTimeout, r.beforeSnapshotRead)
+	// The slot now exists, so the first scope's rows and resume cursor come
+	// from the same readSnapshot every later scope uses via Snapshot - there
+	// is no need for the slot's own exported snapshot.
+	rows, cursor, err := readSnapshot(ctx, management, spec, scope, r.config.ShutdownTimeout, r.beforeSnapshotRead)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	startLSN, err := pglogrepl.ParseLSN(created.resumeLSN)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("%w: invalid bootstrap consistent point", ErrPostgresServer)
-	}
-	if err := r.startReplication(ctx, stream.Conn(), startLSN); err != nil {
+	if err := r.startReplication(ctx, stream.Conn(), cursor); err != nil {
 		return Snapshot{}, err
 	}
 
 	r.bootstrapMu.Lock()
 	r.bootstrapStream = stream
-	r.bootstrapLSN = startLSN
+	r.bootstrapLSN = cursor
 	r.bootstrapMu.Unlock()
 	streamTransferred = true
 	r.setConnectionState("streaming")
 
 	return Snapshot{
 		SourceID: spec.SourceID,
-		Cursor:   created.resumeLSN,
+		Cursor:   cursor.String(),
 		Rows:     rows,
 	}, nil
 }
@@ -655,38 +735,29 @@ func sameStrings(left, right []string) bool {
 	return true
 }
 
-type slotCreation struct {
-	resumeLSN    string
-	snapshotName string
-}
-
 // createBootstrapSlot creates the only safe initial source boundary: a new
-// persistent slot paired with PostgreSQL's exported snapshot.
-func (r *Reader) createBootstrapSlot(ctx context.Context, stream *CDC, management *pgx.Conn) (slotCreation, error) {
+// persistent replication slot. It does not export a snapshot itself -
+// readSnapshot takes its own once the slot exists, the same way Snapshot
+// does for every later scope.
+func (r *Reader) createBootstrapSlot(ctx context.Context, stream *CDC, management *pgx.Conn) error {
 	_, found, err := lookupSlot(ctx, management, r.config.SlotName)
 	if err != nil {
-		return slotCreation{}, err
+		return err
 	}
 	if found {
-		return slotCreation{}, ErrBootstrapSlotExists
+		return ErrBootstrapSlotExists
 	}
 
-	created, err := pglogrepl.CreateReplicationSlot(ctx, stream.Conn(), r.config.SlotName, "pgoutput", pglogrepl.CreateReplicationSlotOptions{
-		SnapshotAction: "EXPORT_SNAPSHOT",
-	})
+	_, err = pglogrepl.CreateReplicationSlot(ctx, stream.Conn(), r.config.SlotName, "pgoutput", pglogrepl.CreateReplicationSlotOptions{})
 	if err != nil {
-		// A concurrent bootstrap may win after our lookup, but its exported
-		// snapshot belongs to that operation and cannot be reused here.
+		// A concurrent bootstrap may win after our lookup.
 		if isDuplicateObject(err) {
-			return slotCreation{}, ErrBootstrapSlotExists
+			return ErrBootstrapSlotExists
 		}
-		return slotCreation{}, classifyPostgresError(err)
+		return classifyPostgresError(err)
 	}
 
-	return slotCreation{
-		resumeLSN:    created.ConsistentPoint,
-		snapshotName: created.SnapshotName,
-	}, nil
+	return nil
 }
 
 func (r *Reader) dropSlot(stream *CDC, slotName string) error {
@@ -709,18 +780,24 @@ func (r *Reader) dropSlot(stream *CDC, slotName string) error {
 	return classifyPostgresError(err)
 }
 
+// readSnapshot takes a gap-free scoped read paired with a resume cursor.
+// Exporting this transaction's own snapshot before reading
+// pg_current_wal_lsn() pins a definite instant: the recorded cursor is
+// guaranteed at or after everything the read can see, so replaying after it
+// never re-delivers a snapshotted row. Both Bootstrap and Snapshot use this
+// same function - Bootstrap needs no exported slot-creation snapshot,
+// because this one, taken right after the slot exists, is just as gap-free.
 func readSnapshot(
 	ctx context.Context,
 	conn *pgx.Conn,
 	spec ProjectionSpec,
 	scope Scope,
-	snapshotName string,
 	cleanupTimeout time.Duration,
 	beforeRead func(context.Context) error,
-) ([]map[string]any, error) {
+) ([]map[string]any, pglogrepl.LSN, error) {
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return nil, classifyPostgresError(err)
+		return nil, 0, classifyPostgresError(err)
 	}
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
@@ -728,15 +805,38 @@ func readSnapshot(
 		_ = tx.Rollback(cleanupCtx)
 	}()
 
-	if _, err := tx.Exec(ctx, "SET TRANSACTION SNAPSHOT "+quoteLiteral(snapshotName)); err != nil {
-		return nil, classifySnapshotError(err)
+	var snapshotName string
+	if err := tx.QueryRow(ctx, "SELECT pg_export_snapshot()").Scan(&snapshotName); err != nil {
+		return nil, 0, classifyPostgresError(err)
 	}
+
+	var cursorText string
+	if err := tx.QueryRow(ctx, "SELECT pg_current_wal_lsn()").Scan(&cursorText); err != nil {
+		return nil, 0, classifyPostgresError(err)
+	}
+	cursor, err := pglogrepl.ParseLSN(cursorText)
+	if err != nil {
+		return nil, 0, fmt.Errorf("%w: invalid snapshot cursor", ErrPostgresServer)
+	}
+
 	if beforeRead != nil {
 		if err := beforeRead(ctx); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 
+	rows, err := scanScopedRows(ctx, tx, spec, scope)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, 0, classifyPostgresError(err)
+	}
+
+	return rows, cursor, nil
+}
+
+func scanScopedRows(ctx context.Context, tx pgx.Tx, spec ProjectionSpec, scope Scope) ([]map[string]any, error) {
 	tableName := pgx.Identifier{spec.Schema, spec.Table}.Sanitize()
 	scopeColumn := pgx.Identifier{spec.ScopeColumn}.Sanitize()
 	rows, err := tx.Query(
@@ -767,31 +867,25 @@ func readSnapshot(
 	if err := rows.Err(); err != nil {
 		return nil, classifyPostgresError(err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, classifyPostgresError(err)
-	}
-
 	return snapshotRows, nil
 }
 
-func quoteLiteral(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
-}
-
 type slotState struct {
-	slotType  string
-	plugin    string
-	active    bool
-	resumeLSN string
+	slotType   string
+	plugin     string
+	active     bool
+	resumeLSN  string
+	restartLSN string
 }
 
 func lookupSlot(ctx context.Context, conn *pgx.Conn, slotName string) (slotState, bool, error) {
 	var slot slotState
 	err := conn.QueryRow(ctx, `
 		SELECT slot_type, plugin, active,
-		       COALESCE(confirmed_flush_lsn::text, restart_lsn::text, '')
+		       COALESCE(confirmed_flush_lsn::text, restart_lsn::text, ''),
+		       COALESCE(restart_lsn::text, '')
 		FROM pg_replication_slots
-		WHERE slot_name = $1`, slotName).Scan(&slot.slotType, &slot.plugin, &slot.active, &slot.resumeLSN)
+		WHERE slot_name = $1`, slotName).Scan(&slot.slotType, &slot.plugin, &slot.active, &slot.resumeLSN, &slot.restartLSN)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return slotState{}, false, nil
 	}
@@ -1001,16 +1095,6 @@ func classifyConnectionError(err error) error {
 		return classified
 	}
 	return fmt.Errorf("%w: %v", ErrSourceUnavailable, err)
-}
-
-func classifySnapshotError(err error) error {
-	if postgresError, ok := errors.AsType[*pgconn.PgError](err); ok {
-		switch postgresError.SQLState() {
-		case "22023", "42704": // invalid or no-longer-existing snapshot identifier
-			return terminalError(ErrSnapshotExpired, postgresError.SQLState())
-		}
-	}
-	return classifyPostgresError(err)
 }
 
 func classifySQLState(sqlState, message string) error {

@@ -96,9 +96,7 @@ type Snapshot struct {
 
 ### Exported snapshot
 
-An exported snapshot is a PostgreSQL snapshot token that another transaction can import. It lets two different database connections agree on the same point in time.
-
-That matters because creating a replication slot happens on a replication-protocol connection, while reading table rows is an ordinary SQL query. The exported token lets the SQL read see exactly the database state associated with the new slot’s initial WAL position.
+`pg_export_snapshot()` pins the calling transaction's repeatable-read snapshot to a definite, nameable instant. watchd does not use it to hand a snapshot to another connection; it uses it as a synchronization point within the same transaction, immediately followed by `pg_current_wal_lsn()`. That guarantees the recorded WAL position is at or after everything the snapshot can see, which is what makes a scoped read's rows and its resume cursor a matched, gap-free pair.
 
 ### Sink
 
@@ -144,15 +142,13 @@ For a brand-new source, the owner calls:
 snapshot, err := reader.Bootstrap(ctx, projection, scope)
 ```
 
-`Bootstrap` is the only normal slot-creation path. It does the following, in this order:
+`Bootstrap` is the only slot-creation path. It does the following, in this order:
 
 1. Validates the projection and scope. It checks identifiers, connects to the source, verifies the publication/table relationship, and verifies that the configured scope column and primary key exist.
-2. Opens a replication connection and creates a persistent `pgoutput` logical slot with PostgreSQL’s `EXPORT_SNAPSHOT` option.
-3. Receives two linked values from PostgreSQL: the slot’s consistent WAL position `P`, and an exported snapshot token.
-4. Keeps that replication connection open. The exported token remains usable only while its creator connection lives.
-5. Opens a normal SQL connection, begins a repeatable-read read-only transaction, imports the token, and executes the scoped `SELECT`.
-6. Builds `Snapshot{Rows, Cursor: P}` from that consistent SQL result.
-7. Before returning, starts logical replication at exactly `P` on the original replication connection. The returned `Reader` now owns an already-started stream.
+2. Opens a replication connection and creates a persistent `pgoutput` logical slot. Slot creation exports no snapshot of its own; the read below takes one on a separate connection instead.
+3. On a normal SQL connection, takes the same gap-free scoped read `Snapshot` uses for every later scope (see below): begins a repeatable-read read-only transaction, exports that transaction's own snapshot, records `pg_current_wal_lsn()` as `P`, and runs the scoped `SELECT` against it.
+4. Builds `Snapshot{Rows, Cursor: P}` from that consistent SQL result.
+5. Before returning, starts logical replication at exactly `P` on the original replication connection. The returned `Reader` now owns an already-started stream.
 
 The important ordering is that the stream starts before `Bootstrap` returns. There is no later period in which the caller has a snapshot but has not yet caused the reader to begin at its paired cursor.
 
@@ -211,7 +207,27 @@ Earlier designs had an `InitializeSlot` operation: create a slot now, then do ot
 
 By itself, a created slot is only a bookmark. It does not provide the matching table rows, and separately reading the table later reintroduces the snapshot/stream gap. A caller could also create a slot and forget it, causing PostgreSQL to retain WAL indefinitely.
 
-`Bootstrap` is the safer public operation because it creates the slot, obtains the exported snapshot, reads the paired rows, and starts the stream as one carefully ordered lifecycle.
+`Bootstrap` is the safer public operation because it creates the slot, reads the paired rows, and starts the stream as one carefully ordered lifecycle.
+
+## Adding a second scope: `Snapshot`
+
+`Bootstrap` only creates a slot once per source. That leaves no defined way for a later scope to catch up, since creating a slot per scope would exhaust `max_replication_slots` and retain WAL per scope for no reason — one slot already carries every scope's changes once a consumer is subscribed to the whole publication.
+
+`Snapshot` is the operation for that case:
+
+```go
+snapshot, err := reader.Snapshot(ctx, projection, scope)
+```
+
+It assumes the slot already exists — it returns `ErrSlotNotFound` if `Bootstrap` has not run yet — and otherwise does not touch the slot at all: it takes the same gap-free scoped read described above (export a fresh snapshot, record `pg_current_wal_lsn()`, run the scoped `SELECT`) on its own connection. The result pairs the scope's rows with a cursor exactly the way `Bootstrap` pairs its rows with `P`, but without creating anything.
+
+Because `Snapshot` never claims the slot's replication connection, any number of scopes can call it at once, and it works whether or not `Run` is currently streaming from the slot.
+
+### The replay-window pairing rule
+
+A cursor from `Snapshot` is only a safe resume boundary if the slot has retained every change after it. PostgreSQL will eventually reuse WAL older than a slot's `restart_lsn`, so if the retained window has already moved past the cursor by the time `Snapshot` finishes, resuming from that cursor would silently skip changes instead of failing loudly.
+
+`Snapshot` checks this before returning: it re-reads the slot's `restart_lsn` and compares it against the cursor it just captured. If the window has already closed, it returns `ErrSnapshotWindowClosed` instead of a boundary that looks usable but is not. The caller's only correct response is to call `Snapshot` again for a fresh cursor — there is no way to repair a closed window after the fact.
 
 ## What is implemented now, and what belongs above it
 
@@ -221,7 +237,7 @@ It is not yet the entire production watchd product. The higher-level runtime/con
 
 - durable local projection storage and persisted applied cursors;
 - a watch API and SDK that let applications register/query projections;
-- coordination when multiple scopes share one source stream;
+- routing each scope's committed changes from the one shared stream to the right local projection, and retrying `Snapshot` when `ErrSnapshotWindowClosed` occurs;
 - leader election or ownership so two replicas do not consume the same slot unintentionally;
 - explicit resync, source replacement, and orphan-slot cleanup after a hard crash;
 - operational monitoring for slot lag, retained WAL, failed sinks, and bootstrap progress;
