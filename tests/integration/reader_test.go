@@ -11,7 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/nenad/watchd/internal/cdc"
+	"github.com/usernamenenad/watchd/internal/cdc"
 )
 
 const defaultAdminURL = "postgres://postgres:postgres@127.0.0.1:54329/watchd"
