@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pglogrepl"
-	"github.com/nenad/watchd/internal/cdc"
+	"github.com/usernamenenad/watchd/internal/cdc"
 )
 
 func TestCDCConnectsInReplicationMode(t *testing.T) {
