@@ -58,6 +58,14 @@ var (
 	// snapshot because the configured slot already exists. Reusing that slot
 	// would not provide a snapshot paired with its original consistent point.
 	ErrBootstrapSlotExists = errors.New("cdc: bootstrap requires a new replication slot")
+	// ErrSlotNotFound indicates that a per-scope Snapshot was requested
+	// before the reader's replication slot exists. Only Bootstrap creates it.
+	ErrSlotNotFound = errors.New("cdc: replication slot does not exist")
+	// ErrSnapshotWindowClosed indicates that a per-scope snapshot's cursor
+	// fell outside the replication slot's retained replay window before the
+	// snapshot could be paired with it, so resuming from that cursor could
+	// silently skip changes. The caller must take a fresh snapshot.
+	ErrSnapshotWindowClosed = errors.New("cdc: snapshot cursor is outside the replication slot's replay window")
 )
 
 const (
@@ -175,6 +183,86 @@ func NewReader(config ReaderConfig, sink TransactionSink) (*Reader, error) {
 			ConnectionState: "idle",
 		},
 	}, nil
+}
+
+// Snapshot reads one scope's rows plus a resume cursor, using the reader's
+// existing slot instead of creating one. Unlike Bootstrap, it can be called
+// for any number of scopes, at any time, concurrently with Run and with
+// other Snapshot calls.
+//
+// Cursor is only safe to resume from if the slot has retained every change
+// after it. Snapshot checks that and returns ErrSnapshotWindowClosed if the
+// slot has already moved past Cursor - the caller should just retry with a
+// fresh snapshot.
+func (r *Reader) Snapshot(ctx context.Context, spec ProjectionSpec, scope Scope) (Snapshot, error) {
+	if err := validateProjectionSpecConfig(spec); err != nil {
+		return Snapshot{}, err
+	}
+
+	management, err := r.connectManagementWithTimeout(ctx)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	defer r.closeManagementConnection(management)
+
+	if err := r.validatePublication(ctx, management); err != nil {
+		return Snapshot{}, err
+	}
+	if err := r.validateProjectionSpec(ctx, management, spec); err != nil {
+		return Snapshot{}, err
+	}
+
+	slot, found, err := lookupSlot(ctx, management, r.config.SlotName)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if !found {
+		return Snapshot{}, ErrSlotNotFound
+	}
+	// Unlike requireSlot, Snapshot does not need the slot to be inactive: it
+	// never takes over the slot's replication connection, so it must work
+	// while Run owns the slot and other Snapshot calls run concurrently.
+	if slot.slotType != "logical" || slot.plugin != "pgoutput" {
+		return Snapshot{}, ErrSlotInvalidated
+	}
+
+	rows, cursor, err := scopedSnapshotRead(ctx, management, spec, scope, r.config.ShutdownTimeout, r.beforeSnapshotRead)
+	if err != nil {
+		return Snapshot{}, err
+	}
+
+	if err := r.checkReplayWindow(ctx, management, cursor); err != nil {
+		return Snapshot{}, err
+	}
+
+	return Snapshot{
+		SourceID: spec.SourceID,
+		Cursor:   cursor.String(),
+		Rows:     rows,
+	}, nil
+}
+
+// checkReplayWindow re-reads the slot's retained boundary after a snapshot
+// read commits and confirms cursor is still at or after it. restart_lsn is
+// the oldest WAL position PostgreSQL still guarantees to retain for the
+// slot; a cursor behind it means changes between the two may already be
+// gone, so resuming from cursor could silently skip them.
+func (r *Reader) checkReplayWindow(ctx context.Context, management *pgx.Conn, cursor pglogrepl.LSN) error {
+	slot, found, err := lookupSlot(ctx, management, r.config.SlotName)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrSlotNotFound
+	}
+	restartLSN, err := parseLSN(slot.restartLSN)
+	if err != nil {
+		return err
+	}
+	if cursor < restartLSN {
+		return ErrSnapshotWindowClosed
+	}
+	return nil
 }
 
 // Bootstrap creates a new persistent slot with an exported snapshot, reads
@@ -737,6 +825,73 @@ func readSnapshot(
 		}
 	}
 
+	rows, err := scanScopedRows(ctx, tx, spec, scope)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, classifyPostgresError(err)
+	}
+
+	return rows, nil
+}
+
+// scopedSnapshotRead takes a gap-free scoped read paired with a resume
+// cursor, independent of any slot's exported snapshot. Exporting this
+// transaction's own snapshot before reading pg_current_wal_lsn() pins a
+// definite instant: the recorded cursor is guaranteed at or after everything
+// the read can see, so replaying after it never re-delivers a snapshotted
+// row.
+func scopedSnapshotRead(
+	ctx context.Context,
+	conn *pgx.Conn,
+	spec ProjectionSpec,
+	scope Scope,
+	cleanupTimeout time.Duration,
+	beforeRead func(context.Context) error,
+) ([]map[string]any, pglogrepl.LSN, error) {
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, 0, classifyPostgresError(err)
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+		defer cancel()
+		_ = tx.Rollback(cleanupCtx)
+	}()
+
+	var snapshotName string
+	if err := tx.QueryRow(ctx, "SELECT pg_export_snapshot()").Scan(&snapshotName); err != nil {
+		return nil, 0, classifyPostgresError(err)
+	}
+
+	var cursorText string
+	if err := tx.QueryRow(ctx, "SELECT pg_current_wal_lsn()").Scan(&cursorText); err != nil {
+		return nil, 0, classifyPostgresError(err)
+	}
+	cursor, err := pglogrepl.ParseLSN(cursorText)
+	if err != nil {
+		return nil, 0, fmt.Errorf("%w: invalid snapshot cursor", ErrPostgresServer)
+	}
+
+	if beforeRead != nil {
+		if err := beforeRead(ctx); err != nil {
+			return nil, 0, err
+		}
+	}
+
+	rows, err := scanScopedRows(ctx, tx, spec, scope)
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, 0, classifyPostgresError(err)
+	}
+
+	return rows, cursor, nil
+}
+
+func scanScopedRows(ctx context.Context, tx pgx.Tx, spec ProjectionSpec, scope Scope) ([]map[string]any, error) {
 	tableName := pgx.Identifier{spec.Schema, spec.Table}.Sanitize()
 	scopeColumn := pgx.Identifier{spec.ScopeColumn}.Sanitize()
 	rows, err := tx.Query(
@@ -767,10 +922,6 @@ func readSnapshot(
 	if err := rows.Err(); err != nil {
 		return nil, classifyPostgresError(err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, classifyPostgresError(err)
-	}
-
 	return snapshotRows, nil
 }
 
@@ -779,19 +930,21 @@ func quoteLiteral(value string) string {
 }
 
 type slotState struct {
-	slotType  string
-	plugin    string
-	active    bool
-	resumeLSN string
+	slotType   string
+	plugin     string
+	active     bool
+	resumeLSN  string
+	restartLSN string
 }
 
 func lookupSlot(ctx context.Context, conn *pgx.Conn, slotName string) (slotState, bool, error) {
 	var slot slotState
 	err := conn.QueryRow(ctx, `
 		SELECT slot_type, plugin, active,
-		       COALESCE(confirmed_flush_lsn::text, restart_lsn::text, '')
+		       COALESCE(confirmed_flush_lsn::text, restart_lsn::text, ''),
+		       COALESCE(restart_lsn::text, '')
 		FROM pg_replication_slots
-		WHERE slot_name = $1`, slotName).Scan(&slot.slotType, &slot.plugin, &slot.active, &slot.resumeLSN)
+		WHERE slot_name = $1`, slotName).Scan(&slot.slotType, &slot.plugin, &slot.active, &slot.resumeLSN, &slot.restartLSN)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return slotState{}, false, nil
 	}

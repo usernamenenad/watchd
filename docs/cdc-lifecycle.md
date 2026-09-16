@@ -213,6 +213,26 @@ By itself, a created slot is only a bookmark. It does not provide the matching t
 
 `Bootstrap` is the safer public operation because it creates the slot, obtains the exported snapshot, reads the paired rows, and starts the stream as one carefully ordered lifecycle.
 
+## Adding a second scope: `Snapshot`
+
+`Bootstrap` only runs once per source: it creates the slot, and PostgreSQL only exports a snapshot at slot-creation time. That leaves no defined way for a later scope to catch up, since creating a slot per scope would exhaust `max_replication_slots` and retain WAL per scope for no reason — one slot already carries every scope's changes once a consumer is subscribed to the whole publication.
+
+`Snapshot` is the operation for that case:
+
+```go
+snapshot, err := reader.Snapshot(ctx, projection, scope)
+```
+
+It assumes the slot already exists — it returns `ErrSlotNotFound` if `Bootstrap` has not run yet — and otherwise does not touch the slot at all. Instead, on its own management connection it begins a repeatable-read read-only transaction, calls `pg_export_snapshot()` to pin that transaction's snapshot at a definite instant, reads `pg_current_wal_lsn()` immediately after (guaranteed at or after everything the snapshot can see), and runs the scoped `SELECT` inside that same transaction. The result pairs the scope's rows with a cursor exactly the way `Bootstrap` pairs its rows with the slot's consistent point, but without creating anything.
+
+Because `Snapshot` never claims the slot's replication connection, any number of scopes can call it at once, and it works whether or not `Run` is currently streaming from the slot.
+
+### The replay-window pairing rule
+
+A cursor from `Snapshot` is only a safe resume boundary if the slot has retained every change after it. PostgreSQL will eventually reuse WAL older than a slot's `restart_lsn`, so if the retained window has already moved past the cursor by the time `Snapshot` finishes, resuming from that cursor would silently skip changes instead of failing loudly.
+
+`Snapshot` checks this before returning: it re-reads the slot's `restart_lsn` and compares it against the cursor it just captured. If the window has already closed, it returns `ErrSnapshotWindowClosed` instead of a boundary that looks usable but is not. The caller's only correct response is to call `Snapshot` again for a fresh cursor — there is no way to repair a closed window after the fact.
+
 ## What is implemented now, and what belongs above it
 
 The current code is the source-side CDC primitive. It provides a gap-free bootstrap boundary, transaction-aware decoding, sink-before-ack ordering, reconnect/resume behaviour, typed failures, and tests around the important races.
@@ -221,7 +241,7 @@ It is not yet the entire production watchd product. The higher-level runtime/con
 
 - durable local projection storage and persisted applied cursors;
 - a watch API and SDK that let applications register/query projections;
-- coordination when multiple scopes share one source stream;
+- routing each scope's committed changes from the one shared stream to the right local projection, and retrying `Snapshot` when `ErrSnapshotWindowClosed` occurs;
 - leader election or ownership so two replicas do not consume the same slot unintentionally;
 - explicit resync, source replacement, and orphan-slot cleanup after a hard crash;
 - operational monitoring for slot lag, retained WAL, failed sinks, and bootstrap progress;
