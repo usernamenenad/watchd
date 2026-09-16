@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -158,42 +157,6 @@ func TestBootstrapCancellationCleansUpSlotAndTransaction(t *testing.T) {
 	}
 	if idle := idleBootstrapTransactions(t, ctx); idle != 0 {
 		t.Fatalf("cancelled bootstrap left %d idle transaction(s)", idle)
-	}
-}
-
-func TestExpiredExportedSnapshotHasTypedError(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	replication, err := pgconn.Connect(ctx, testReplicationURL)
-	if err != nil {
-		t.Fatalf("connect replication source: %v", err)
-	}
-	slotName := fmt.Sprintf("watchd_expired_snapshot_%d", time.Now().UnixNano())
-	created, err := pglogrepl.CreateReplicationSlot(ctx, replication, slotName, "pgoutput", pglogrepl.CreateReplicationSlotOptions{
-		Temporary:      true,
-		SnapshotAction: "EXPORT_SNAPSHOT",
-	})
-	if err != nil {
-		t.Fatalf("create temporary exported snapshot: %v", err)
-	}
-	if err := replication.Close(ctx); err != nil {
-		t.Fatalf("expire exported snapshot: %v", err)
-	}
-
-	management := connectBootstrapTest(t, ctx, testReplicationURL)
-	defer management.Close(ctx)
-	_, err = readSnapshot(
-		ctx,
-		management,
-		bootstrapTestProjection(),
-		Scope{Value: "00000000-0000-0000-0000-000000000001"},
-		created.SnapshotName,
-		time.Second,
-		nil,
-	)
-	if !errors.Is(err, ErrSnapshotExpired) {
-		t.Fatalf("expired snapshot error = %v, want %v", err, ErrSnapshotExpired)
 	}
 }
 
