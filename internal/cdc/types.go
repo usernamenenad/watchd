@@ -1,6 +1,7 @@
 package cdc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -121,13 +122,24 @@ func MinCursor(cursors ...Cursor) (Cursor, error) {
 }
 
 // Snapshot is a consistent scoped read paired with the opaque cursor at
-// which replication must resume. Like Change.Values, row values are their
-// PostgreSQL text representation or nil for SQL NULL.
+// which replication must resume. Rows are delivered separately through the
+// SnapshotRowSink passed to Snapshot/Bootstrap, not carried on this struct.
 type Snapshot struct {
 	SourceID string
 	Cursor   Cursor
-	Rows     []map[string]any
 }
+
+// TransactionSink is watchd's local durability boundary. Returning nil means
+// that the transaction has been accepted and PostgreSQL may be acknowledged.
+// A sink must tolerate a transaction being delivered more than once.
+type TransactionSink func(context.Context, Transaction) error
+
+// SnapshotRowSink receives one batch of a scoped snapshot read at a time, in
+// primary-key order, within the read's consistent snapshot transaction. Like
+// Change.Values, row values are their PostgreSQL text representation or nil
+// for SQL NULL. Returning an error aborts the read; no cursor is returned
+// and the read's transaction is rolled back.
+type SnapshotRowSink func(context.Context, []map[string]any) error
 
 // UnchangedToast represents a PostgreSQL TOAST value omitted from an UPDATE
 // message because that column did not change. A projection applier must retain

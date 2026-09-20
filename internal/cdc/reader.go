@@ -64,6 +64,9 @@ var (
 	// snapshot could be paired with it, so resuming from that cursor could
 	// silently skip changes. The caller must take a fresh snapshot.
 	ErrSnapshotWindowClosed = errors.New("cdc: snapshot cursor is outside the replication slot's replay window")
+	// ErrSnapshotSinkRequired indicates that Snapshot or Bootstrap was
+	// called without a SnapshotRowSink to receive scoped rows.
+	ErrSnapshotSinkRequired = errors.New("cdc: snapshot row sink is required")
 )
 
 const (
@@ -74,14 +77,10 @@ const (
 	defaultMaxBackoff        = 10 * time.Second
 	defaultMaxAttempts       = 8
 	defaultJitter            = 0.20
+	defaultSnapshotBatchRows = 1000
 )
 
 var postgresIdentifier = regexp.MustCompile(`^[a-z_][a-z0-9_$]{0,62}$`)
-
-// TransactionSink is watchd's local durability boundary. Returning nil means
-// that the transaction has been accepted and PostgreSQL may be acknowledged.
-// A sink must tolerate a transaction being delivered more than once.
-type TransactionSink func(context.Context, Transaction) error
 
 // RetryPolicy bounds reconnect attempts after transient connection failures.
 // MaxAttempts counts retries after the initial attempt.
@@ -109,6 +108,11 @@ type ReaderConfig struct {
 	MaxTransactionBytes   int
 	MaxTransactionChanges int
 	MaxValueBytes         int
+	// SnapshotBatchRows bounds how many rows Snapshot and Bootstrap read from
+	// PostgreSQL per round trip. Rows are delivered to the caller's
+	// SnapshotRowSink one batch at a time, so this also bounds how much of a
+	// scoped snapshot read is held in memory at once.
+	SnapshotBatchRows int
 	// ConnectionTimeout bounds each new PostgreSQL replication or management
 	// connection attempt. It does not bound an already-running stream.
 	ConnectionTimeout time.Duration
@@ -195,7 +199,10 @@ func NewReader(config ReaderConfig, sink TransactionSink) (*Reader, error) {
 // after it. Snapshot checks that and returns ErrSnapshotWindowClosed if the
 // slot has already moved past Cursor - the caller should just retry with a
 // fresh snapshot.
-func (r *Reader) Snapshot(ctx context.Context, spec ProjectionSpec, scope Scope) (Snapshot, error) {
+func (r *Reader) Snapshot(ctx context.Context, spec ProjectionSpec, scope Scope, sink SnapshotRowSink) (Snapshot, error) {
+	if sink == nil {
+		return Snapshot{}, ErrSnapshotSinkRequired
+	}
 	if err := validateProjectionSpecConfig(spec); err != nil {
 		return Snapshot{}, err
 	}
@@ -227,7 +234,7 @@ func (r *Reader) Snapshot(ctx context.Context, spec ProjectionSpec, scope Scope)
 		return Snapshot{}, ErrSlotInvalidated
 	}
 
-	rows, cursor, err := readSnapshot(ctx, management, spec, scope, r.config.ShutdownTimeout, r.beforeSnapshotRead)
+	cursor, err := readSnapshot(ctx, management, spec, scope, r.config.ShutdownTimeout, r.config.SnapshotBatchRows, r.beforeSnapshotRead, sink)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -242,7 +249,6 @@ func (r *Reader) Snapshot(ctx context.Context, spec ProjectionSpec, scope Scope)
 			sourceID: spec.SourceID,
 			lsn:      cursor,
 		},
-		Rows: rows,
 	}, nil
 }
 
@@ -276,7 +282,10 @@ func (r *Reader) checkReplayWindow(ctx context.Context, management *pgx.Conn, cu
 // Bootstrap deliberately refuses an existing slot: reusing one would mean
 // reading against a source history whose starting point this call never
 // established, so it cannot vouch for a gap-free boundary.
-func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope) (Snapshot, error) {
+func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope, sink SnapshotRowSink) (Snapshot, error) {
+	if sink == nil {
+		return Snapshot{}, ErrSnapshotSinkRequired
+	}
 	if err := validateProjectionSpecConfig(spec); err != nil {
 		return Snapshot{}, err
 	}
@@ -321,7 +330,7 @@ func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope
 	// The slot now exists, so the first scope's rows and resume cursor come
 	// from the same readSnapshot every later scope uses via Snapshot - there
 	// is no need for the slot's own exported snapshot.
-	rows, cursor, err := readSnapshot(ctx, management, spec, scope, r.config.ShutdownTimeout, r.beforeSnapshotRead)
+	cursor, err := readSnapshot(ctx, management, spec, scope, r.config.ShutdownTimeout, r.config.SnapshotBatchRows, r.beforeSnapshotRead, sink)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -342,7 +351,6 @@ func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope
 			sourceID: spec.SourceID,
 			lsn:      cursor,
 		},
-		Rows: rows,
 	}, nil
 }
 
@@ -802,11 +810,13 @@ func readSnapshot(
 	spec ProjectionSpec,
 	scope Scope,
 	cleanupTimeout time.Duration,
+	batchRows int,
 	beforeRead func(context.Context) error,
-) ([]map[string]any, pglogrepl.LSN, error) {
+	sink SnapshotRowSink,
+) (pglogrepl.LSN, error) {
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
-		return nil, 0, classifyPostgresError(err)
+		return 0, classifyPostgresError(err)
 	}
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
@@ -816,67 +826,125 @@ func readSnapshot(
 
 	var snapshotName string
 	if err := tx.QueryRow(ctx, "SELECT pg_export_snapshot()").Scan(&snapshotName); err != nil {
-		return nil, 0, classifyPostgresError(err)
+		return 0, classifyPostgresError(err)
 	}
 
 	var cursorText string
 	if err := tx.QueryRow(ctx, "SELECT pg_current_wal_lsn()").Scan(&cursorText); err != nil {
-		return nil, 0, classifyPostgresError(err)
+		return 0, classifyPostgresError(err)
 	}
 	cursor, err := pglogrepl.ParseLSN(cursorText)
 	if err != nil {
-		return nil, 0, fmt.Errorf("%w: invalid snapshot cursor", ErrPostgresServer)
+		return 0, fmt.Errorf("%w: invalid snapshot cursor", ErrPostgresServer)
 	}
 
 	if beforeRead != nil {
 		if err := beforeRead(ctx); err != nil {
-			return nil, 0, err
+			return 0, err
 		}
 	}
 
-	rows, err := scanScopedRows(ctx, tx, spec, scope)
-	if err != nil {
-		return nil, 0, err
+	if err := scanScopedRows(ctx, tx, spec, scope, batchRows, sink); err != nil {
+		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, 0, classifyPostgresError(err)
+		return 0, classifyPostgresError(err)
 	}
 
-	return rows, cursor, nil
+	return cursor, nil
 }
 
-func scanScopedRows(ctx context.Context, tx pgx.Tx, spec ProjectionSpec, scope Scope) ([]map[string]any, error) {
+// scanScopedRows reads a scope in primary-key-ordered batches of at most
+// batchRows, invoking sink once per batch instead of holding the whole
+// scoped result set in memory. Every batch runs inside tx's existing
+// snapshot, so pagination sees no more or less than a single unbounded read
+// of the same scope would have.
+func scanScopedRows(ctx context.Context, tx pgx.Tx, spec ProjectionSpec, scope Scope, batchRows int, sink SnapshotRowSink) error {
 	tableName := pgx.Identifier{spec.Schema, spec.Table}.Sanitize()
 	scopeColumn := pgx.Identifier{spec.ScopeColumn}.Sanitize()
-	rows, err := tx.Query(
-		ctx,
-		fmt.Sprintf("SELECT * FROM %s WHERE %s = $1", tableName, scopeColumn),
-		pgx.QueryResultFormats{pgx.TextFormatCode},
-		scope.Value,
-	)
-	if err != nil {
-		return nil, classifyPostgresError(err)
-	}
-	defer rows.Close()
+	pkColumns := make([]string, len(spec.PrimaryKey))
 
-	fields := rows.FieldDescriptions()
-	snapshotRows := make([]map[string]any, 0)
-	for rows.Next() {
-		values := rows.RawValues()
-		row := make(map[string]any, len(fields))
-		for index, field := range fields {
-			if values[index] == nil {
-				row[field.Name] = nil
-				continue
+	for index, column := range spec.PrimaryKey {
+		pkColumns[index] = pgx.Identifier{column}.Sanitize()
+	}
+
+	orderBy := strings.Join(pkColumns, ", ")
+	pkTuple := "(" + orderBy + ")"
+
+	fetchBatch := func(lastKey []string) ([]map[string]any, error) {
+		queryArgs := []any{scope.Value}
+		query := fmt.Sprintf("SELECT * FROM %s WHERE %s = $1", tableName, scopeColumn)
+		if lastKey != nil {
+			placeholders := make([]string, len(lastKey))
+			for index, value := range lastKey {
+				queryArgs = append(queryArgs, value)
+				placeholders[index] = fmt.Sprintf("$%d", len(queryArgs))
 			}
-			row[field.Name] = string(values[index])
+			query += fmt.Sprintf(" AND %s > (%s)", pkTuple, strings.Join(placeholders, ", "))
 		}
-		snapshotRows = append(snapshotRows, row)
+		queryArgs = append(queryArgs, batchRows)
+		query += fmt.Sprintf(" ORDER BY %s LIMIT $%d", orderBy, len(queryArgs))
+
+		args := append([]any{pgx.QueryResultFormats{pgx.TextFormatCode}}, queryArgs...)
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return nil, classifyPostgresError(err)
+		}
+		defer rows.Close()
+
+		fields := rows.FieldDescriptions()
+		batch := make([]map[string]any, 0, batchRows)
+		for rows.Next() {
+			values := rows.RawValues()
+			row := make(map[string]any, len(fields))
+			for index, field := range fields {
+				if values[index] == nil {
+					row[field.Name] = nil
+					continue
+				}
+				row[field.Name] = string(values[index])
+			}
+			batch = append(batch, row)
+		}
+
+		if err := rows.Err(); err != nil {
+			return nil, classifyPostgresError(err)
+		}
+
+		return batch, nil
 	}
-	if err := rows.Err(); err != nil {
-		return nil, classifyPostgresError(err)
+
+	var lastKey []string
+	for {
+		batch, err := fetchBatch(lastKey)
+		if err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			return nil
+		}
+
+		if err := sink(ctx, batch); err != nil {
+			return err
+		}
+
+		lastRow := batch[len(batch)-1]
+		nextKey := make([]string, len(spec.PrimaryKey))
+		for index, column := range spec.PrimaryKey {
+			// Primary-key columns can never be SQL NULL, so a non-string
+			// value here means the row didn't actually contain this column.
+			value, ok := lastRow[column].(string)
+			if !ok {
+				return fmt.Errorf("%w: primary key column %q missing or NULL in scanned row", ErrPostgresServer, column)
+			}
+			nextKey[index] = value
+		}
+		lastKey = nextKey
+
+		if len(batch) < batchRows {
+			return nil
+		}
 	}
-	return snapshotRows, nil
 }
 
 type slotState struct {
@@ -1004,6 +1072,9 @@ func normalizeReaderConfig(config ReaderConfig) ReaderConfig {
 	if config.MaxValueBytes == 0 {
 		config.MaxValueBytes = defaultMaxValueBytes
 	}
+	if config.SnapshotBatchRows == 0 {
+		config.SnapshotBatchRows = defaultSnapshotBatchRows
+	}
 	if config.ConnectionTimeout == 0 {
 		config.ConnectionTimeout = defaultConnectionTimeout
 	}
@@ -1035,7 +1106,7 @@ func validateReaderConfig(config ReaderConfig, sink TransactionSink) error {
 	if !postgresIdentifier.MatchString(config.SlotName) || !postgresIdentifier.MatchString(config.PublicationName) {
 		return fmt.Errorf("%w: slot and publication names must be unquoted PostgreSQL identifiers", ErrInvalidReaderConfig)
 	}
-	if config.MaxTransactionBytes <= 0 || config.MaxTransactionChanges <= 0 || config.MaxValueBytes <= 0 || config.ConnectionTimeout <= 0 || config.StatusInterval <= 0 || config.ShutdownTimeout <= 0 {
+	if config.MaxTransactionBytes <= 0 || config.MaxTransactionChanges <= 0 || config.MaxValueBytes <= 0 || config.SnapshotBatchRows <= 0 || config.ConnectionTimeout <= 0 || config.StatusInterval <= 0 || config.ShutdownTimeout <= 0 {
 		return ErrInvalidReaderConfig
 	}
 	if config.MaxValueBytes > config.MaxTransactionBytes {

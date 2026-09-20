@@ -82,7 +82,7 @@ func TestBootstrapClassifiesUnavailableSource(t *testing.T) {
 		Table:       "projection",
 		ScopeColumn: "tenant_id",
 		PrimaryKey:  []string{"tenant_id", "id"},
-	}, Scope{Value: "tenant-a"})
+	}, Scope{Value: "tenant-a"}, func(context.Context, []map[string]any) error { return nil })
 	if !errors.Is(err, ErrSourceUnavailable) {
 		t.Fatalf("Bootstrap error = %v, want %v", err, ErrSourceUnavailable)
 	}
