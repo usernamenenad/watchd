@@ -121,20 +121,24 @@ func TestReaderBootstrapReturnsScopedSnapshotAndRetainsStream(t *testing.T) {
 		return nil
 	})
 
+	var rows []map[string]any
 	snapshot, err := reader.Bootstrap(ctx, cdc.ProjectionSpec{
 		SourceID:    "test-postgres",
 		Schema:      "public",
 		Table:       "tenant_permissions_projection",
 		ScopeColumn: "tenant_id",
 		PrimaryKey:  []string{"tenant_id", "user_id"},
-	}, cdc.Scope{Value: tenantID})
+	}, cdc.Scope{Value: tenantID}, func(_ context.Context, batch []map[string]any) error {
+		rows = append(rows, batch...)
+		return nil
+	})
 	if err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
 	if snapshot.SourceID != "test-postgres" || snapshot.Cursor.IsZero() {
 		t.Fatalf("snapshot metadata = %#v, want source identity and cursor", snapshot)
 	}
-	if got, want := len(snapshot.Rows), 1; got != want {
+	if got, want := len(rows), 1; got != want {
 		t.Fatalf("snapshot rows = %d, want %d scoped row", got, want)
 	}
 
@@ -185,7 +189,7 @@ func TestReaderBootstrapRejectsMissingScopeColumnWithoutCreatingSlot(t *testing.
 		Table:       "tenant_permissions_projection",
 		ScopeColumn: "missing_scope_column",
 		PrimaryKey:  []string{"tenant_id", "user_id"},
-	}, cdc.Scope{Value: "irrelevant"})
+	}, cdc.Scope{Value: "irrelevant"}, func(context.Context, []map[string]any) error { return nil })
 	if !errors.Is(err, cdc.ErrInvalidReaderConfig) {
 		t.Fatalf("bootstrap error = %v, want invalid projection configuration", err)
 	}
@@ -209,7 +213,7 @@ func TestReaderBootstrapCleansUpSlotAfterSnapshotQueryFailure(t *testing.T) {
 		Table:       "tenant_permissions_projection",
 		ScopeColumn: "tenant_id",
 		PrimaryKey:  []string{"tenant_id", "user_id"},
-	}, cdc.Scope{Value: "not-a-uuid"})
+	}, cdc.Scope{Value: "not-a-uuid"}, func(context.Context, []map[string]any) error { return nil })
 	if err == nil {
 		t.Fatal("bootstrap succeeded with an invalid UUID scope")
 	}
@@ -232,7 +236,7 @@ func TestReaderBootstrapClassifiesInsufficientReplicationPrivilege(t *testing.T)
 		t.Fatalf("new reader: %v", err)
 	}
 
-	_, err = reader.Bootstrap(ctx, integrationProjectionSpec(), cdc.Scope{Value: "00000000-0000-0000-0000-000000000001"})
+	_, err = reader.Bootstrap(ctx, integrationProjectionSpec(), cdc.Scope{Value: "00000000-0000-0000-0000-000000000001"}, func(context.Context, []map[string]any) error { return nil })
 	if !errors.Is(err, cdc.ErrInsufficientPrivileges) {
 		t.Fatalf("bootstrap error = %v, want insufficient privileges", err)
 	}
@@ -252,7 +256,7 @@ func TestReaderBootstrapRejectsInvalidPublication(t *testing.T) {
 		t.Fatalf("new reader: %v", err)
 	}
 
-	_, err = reader.Bootstrap(ctx, integrationProjectionSpec(), cdc.Scope{Value: "00000000-0000-0000-0000-000000000001"})
+	_, err = reader.Bootstrap(ctx, integrationProjectionSpec(), cdc.Scope{Value: "00000000-0000-0000-0000-000000000001"}, func(context.Context, []map[string]any) error { return nil })
 	if !errors.Is(err, cdc.ErrInvalidReaderConfig) {
 		t.Fatalf("bootstrap error = %v, want invalid configuration", err)
 	}

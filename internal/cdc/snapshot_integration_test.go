@@ -43,7 +43,7 @@ func TestSnapshotBootstrapsSecondScopeAgainstExistingSlot(t *testing.T) {
 	})
 	registerBootstrapCleanup(t, reader, slotName)
 
-	if _, err := reader.Bootstrap(ctx, bootstrapTestProjection(), Scope{Value: firstTenant}); err != nil {
+	if _, err := reader.Bootstrap(ctx, bootstrapTestProjection(), Scope{Value: firstTenant}, func(context.Context, []map[string]any) error { return nil }); err != nil {
 		t.Fatalf("bootstrap first scope: %v", err)
 	}
 
@@ -78,12 +78,14 @@ func TestSnapshotBootstrapsSecondScopeAgainstExistingSlot(t *testing.T) {
 
 	type snapshotResult struct {
 		snapshot Snapshot
+		rows     []map[string]any
 		err      error
 	}
 	snapshotDone := make(chan snapshotResult, 1)
 	go func() {
-		snapshot, err := reader.Snapshot(ctx, bootstrapTestProjection(), Scope{Value: secondTenant})
-		snapshotDone <- snapshotResult{snapshot: snapshot, err: err}
+		var rows []map[string]any
+		snapshot, err := reader.Snapshot(ctx, bootstrapTestProjection(), Scope{Value: secondTenant}, collectSnapshotRows(&rows))
+		snapshotDone <- snapshotResult{snapshot: snapshot, rows: rows, err: err}
 	}()
 
 	select {
@@ -102,7 +104,7 @@ func TestSnapshotBootstrapsSecondScopeAgainstExistingSlot(t *testing.T) {
 	if result.err != nil {
 		t.Fatalf("snapshot second scope: %v", result.err)
 	}
-	projection := projectionFromBootstrapSnapshot(t, result.snapshot, secondTenant)
+	projection := projectionFromBootstrapSnapshot(t, result.rows, secondTenant)
 
 	if err := writeAfterBootstrapTest(ctx, app, secondTenant, beforeUser, duringUser, afterUser); err != nil {
 		t.Fatalf("write after snapshot: %v", err)
@@ -134,7 +136,7 @@ func TestSnapshotBeforeSlotExistsHasTypedError(t *testing.T) {
 	reader := newBootstrapTestReader(t, slotName, func(context.Context, Transaction) error { return nil })
 	registerBootstrapCleanup(t, reader, slotName)
 
-	_, err := reader.Snapshot(ctx, bootstrapTestProjection(), Scope{Value: "00000000-0000-0000-0000-000000000001"})
+	_, err := reader.Snapshot(ctx, bootstrapTestProjection(), Scope{Value: "00000000-0000-0000-0000-000000000001"}, func(context.Context, []map[string]any) error { return nil })
 	if !errors.Is(err, ErrSlotNotFound) {
 		t.Fatalf("snapshot without a slot error = %v, want %v", err, ErrSlotNotFound)
 	}
@@ -247,7 +249,7 @@ func TestConcurrentSnapshotsOfDifferentScopesDoNotSerialize(t *testing.T) {
 	reader := newBootstrapTestReader(t, slotName, func(context.Context, Transaction) error { return nil })
 	registerBootstrapCleanup(t, reader, slotName)
 
-	if _, err := reader.Bootstrap(ctx, bootstrapTestProjection(), Scope{Value: firstTenant}); err != nil {
+	if _, err := reader.Bootstrap(ctx, bootstrapTestProjection(), Scope{Value: firstTenant}, func(context.Context, []map[string]any) error { return nil }); err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
 	runCtx, stop := context.WithCancel(ctx)
@@ -266,7 +268,7 @@ func TestConcurrentSnapshotsOfDifferentScopesDoNotSerialize(t *testing.T) {
 		wg.Add(1)
 		go func(scope string) {
 			defer wg.Done()
-			_, err := reader.Snapshot(ctx, bootstrapTestProjection(), Scope{Value: scope})
+			_, err := reader.Snapshot(ctx, bootstrapTestProjection(), Scope{Value: scope}, func(context.Context, []map[string]any) error { return nil })
 			results <- err
 		}(tenant)
 	}
@@ -276,6 +278,90 @@ func TestConcurrentSnapshotsOfDifferentScopesDoNotSerialize(t *testing.T) {
 		if err != nil {
 			t.Fatalf("concurrent snapshot: %v", err)
 		}
+	}
+}
+
+// TestBootstrapSnapshotDeliversRowsInPaginatedBatches confirms that a scope
+// larger than one SnapshotBatchRows page is read as several ordered,
+// non-overlapping keyset-paginated batches rather than one unbounded query,
+// and that every row still arrives exactly once, in ascending primary-key
+// order across batch boundaries.
+func TestBootstrapSnapshotDeliversRowsInPaginatedBatches(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	app := connectBootstrapTest(t, ctx, testDatabaseURL)
+	defer app.Close(ctx)
+	if _, err := app.Exec(ctx, "DELETE FROM tenant_permissions_projection"); err != nil {
+		t.Fatalf("clear projection: %v", err)
+	}
+
+	tenantID := "00000000-0000-0000-0000-000000000040"
+	const rowCount = 25
+	const batchRows = 10
+	if _, err := app.Exec(ctx, `
+		INSERT INTO tenant_permissions_projection (tenant_id, user_id, permissions)
+		SELECT $1, ('00000000-0000-0000-0000-' || lpad(i::text, 12, '0'))::uuid, '{"role":"viewer"}'
+		FROM generate_series(1, $2) AS i`, tenantID, rowCount); err != nil {
+		t.Fatalf("seed paginated scope: %v", err)
+	}
+
+	slotName := fmt.Sprintf("watchd_paginated_scope_%d", time.Now().UnixNano())
+	reader, err := NewReader(ReaderConfig{
+		DatabaseURL:       testReplicationURL,
+		SlotName:          slotName,
+		PublicationName:   testPublication,
+		StatusInterval:    100 * time.Millisecond,
+		ShutdownTimeout:   time.Second,
+		SnapshotBatchRows: batchRows,
+	}, func(context.Context, Transaction) error { return nil })
+	if err != nil {
+		t.Fatalf("new reader: %v", err)
+	}
+	registerBootstrapCleanup(t, reader, slotName)
+
+	var (
+		rows        []map[string]any
+		batchCount  int
+		lastUserID  string
+		sawOrdering = true
+	)
+	_, err = reader.Bootstrap(ctx, bootstrapTestProjection(), Scope{Value: tenantID}, func(_ context.Context, batch []map[string]any) error {
+		batchCount++
+		if len(batch) > batchRows {
+			t.Fatalf("batch size = %d, want at most %d", len(batch), batchRows)
+		}
+		for _, row := range batch {
+			userID := bootstrapString(t, row["user_id"])
+			if lastUserID != "" && userID <= lastUserID {
+				sawOrdering = false
+			}
+			lastUserID = userID
+		}
+		rows = append(rows, batch...)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	if got, want := len(rows), rowCount; got != want {
+		t.Fatalf("snapshot rows = %d, want %d", got, want)
+	}
+	if wantBatches := (rowCount + batchRows - 1) / batchRows; batchCount != wantBatches {
+		t.Fatalf("batches invoked = %d, want %d", batchCount, wantBatches)
+	}
+	if !sawOrdering {
+		t.Fatalf("rows were not delivered in strictly increasing primary-key order: %v", rows)
+	}
+
+	seen := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		userID := bootstrapString(t, row["user_id"])
+		if _, duplicate := seen[userID]; duplicate {
+			t.Fatalf("row for user %s delivered more than once", userID)
+		}
+		seen[userID] = struct{}{}
 	}
 }
 

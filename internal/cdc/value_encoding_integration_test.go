@@ -60,14 +60,15 @@ func TestValueEncodingRoundTripsEveryTypeClassAsText(t *testing.T) {
 		PrimaryKey:  []string{"tenant_id", "item_id"},
 	}
 
-	snapshot, err := reader.Bootstrap(ctx, spec, Scope{Value: tenantID})
+	var rows []map[string]any
+	_, err := reader.Bootstrap(ctx, spec, Scope{Value: tenantID}, collectSnapshotRows(&rows))
 	if err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
-	if len(snapshot.Rows) != 1 {
-		t.Fatalf("snapshot rows = %d, want 1", len(snapshot.Rows))
+	if len(rows) != 1 {
+		t.Fatalf("snapshot rows = %d, want 1", len(rows))
 	}
-	assertRowMatchesText(t, snapshot.Rows[0], map[string]string{
+	assertRowMatchesText(t, rows[0], map[string]string{
 		"tenant_id": tenantID,
 		"item_id":   insertedID,
 		"status":    "active",
