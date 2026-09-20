@@ -22,6 +22,31 @@ A projection table must have a stable primary key. v0 scopes every table using o
 - **consistent cut**: given the progress cursors `c1..cn` of scopes `s1..sn` of one source, `min(c1..cn)` is a boundary a client may treat as a single snapshot-consistent state across those scopes.
 - **resync**: a statement that replay cannot be performed safely; it revokes the watcher's freshness until it replaces its projection with a new snapshot.
 
+## Value encoding
+
+This is the v0 contract for how one PostgreSQL column value is represented, both in `internal/cdc` today and as a constraint any future network encoding (issue #4) must preserve losslessly.
+
+A value is exactly one of:
+
+- **text**: the column's PostgreSQL type-output-function representation - the same string PostgreSQL's own output function for that type produces (this is what `COPY ... TO` in text format and pgoutput both use). This applies uniformly to every column type, including `bytea`, arrays, composite types, `json`/`jsonb`, enums, and domain types: watchd starts logical replication without pgoutput's `binary` option, so PostgreSQL always sends column data through its text output function, whatever the underlying type. No type category is rejected or specially cased at the value layer for this reason; a consumer that needs a typed value parses the text itself (for example, treating a `tags text[]` value's `{a,b}` text as an array literal, or a `jsonb` value's text as JSON).
+
+  **This is not always the same as SQL's `column::text` cast.** `boolean` is the clearest counterexample: `true::text` casts to `"true"`, while the type's output function - and therefore the actual value a watcher receives - is `"t"`. `column::text` is not a safe way to predict or test the wire encoding of a new type; verify against the real replication path, not a SQL cast, when adding one.
+
+  Measured directly against PostgreSQL (`internal/cdc/type_matrix_integration_test.go`, run across every PostgreSQL version this project supports): integers, `numeric`, `real`/`double precision`, `uuid`, arrays, `jsonb`, enums, `bytea`, domains, `inet`/`cidr`, `interval`, `date`/`time`/`timestamp`, and `char(n)` (which blank-pads to its declared width - `'abc'` in a `char(8)` column decodes as `"abc     "`, not `"abc"`) all decode exactly as their PostgreSQL output-function text, matching a `::text` cast. `boolean` is the one documented exception. `timestamptz` is intentionally not pinned to a fixed string: its output depends on the replication session's `TimeZone` setting, which is server configuration, not part of this per-type contract - a consumer of a `timestamptz` column must account for that offset itself. `money` is not covered: its formatting is locale-dependent on the server, which is a bad fit for a fixed wire contract and is better addressed as a configuration-time rejection under #7 than assumed here.
+
+- **null**: SQL NULL. Represented as Go `nil`, never as an empty string or a sentinel value.
+- **unchanged TOAST**: a TOASTed column PostgreSQL omitted from an `UPDATE` message because it did not change. Represented as the distinct `cdc.UnchangedToast` type - never `nil`, never an empty string - so an applier can tell "no change, keep the existing value" apart from "the value is now NULL." Only `Change.Values` can contain this; a `Snapshot` row is a full read and never omits a column this way.
+
+A **key** (`Change.Key`, the replica-identity columns identifying a row) is always present and always text: PostgreSQL sends replica-identity columns in full on every `UPDATE`/`DELETE`, never as NULL (a replica-identity column that could be NULL cannot identify a row) and never as unchanged TOAST (only non-key columns are TOASTed independently of the row's identity). `Change.Key` is therefore typed `map[string]string`, distinct from `Change.Values`' `map[string]any` - the narrower type states this guarantee rather than leaving every caller to re-derive it.
+
+### Size limits
+
+A single value is bounded by a configured per-value limit (`ReaderConfig.MaxValueBytes`, default 1 MiB), independent of the whole-transaction bound (`MaxTransactionBytes`, `MaxTransactionChanges`). `MaxValueBytes` must not exceed `MaxTransactionBytes`. Exceeding either raises a decode error (`cdc.ErrValueTooLarge` for one value, `cdc.ErrTransactionTooLarge` or `cdc.ErrTransactionTooManyChanges` for the batch) instead of retaining an unbounded transaction in memory. These are terminal, not retryable: the same oversized value or batch would recur on any retry.
+
+### What is not representable
+
+A pgoutput column encoding outside text/null/unchanged-toast (for example, binary-format tuple data, which watchd's configuration never requests) is rejected explicitly with `cdc.ErrUnsupportedColumnEncoding` rather than passed through as an opaque byte slice. Silently forwarding an unrepresentable encoding would let a future protocol change mis-decode a value instead of failing loudly.
+
 ## Bootstrap and recovery
 
 When a watcher has no usable cursor, it obtains a snapshot. The snapshot and its change stream must have no gap: every committed mutation is represented either in the snapshot or in the stream after the snapshot cursor.

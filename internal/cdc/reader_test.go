@@ -27,6 +27,9 @@ func TestNewReaderAppliesSafeDefaults(t *testing.T) {
 	if reader.config.MaxTransactionChanges != defaultMaxTransactionChanges {
 		t.Fatalf("MaxTransactionChanges = %d, want %d", reader.config.MaxTransactionChanges, defaultMaxTransactionChanges)
 	}
+	if reader.config.MaxValueBytes != defaultMaxValueBytes {
+		t.Fatalf("MaxValueBytes = %d, want %d", reader.config.MaxValueBytes, defaultMaxValueBytes)
+	}
 	if reader.config.ConnectionTimeout != defaultConnectionTimeout {
 		t.Fatalf("ConnectionTimeout = %s, want %s", reader.config.ConnectionTimeout, defaultConnectionTimeout)
 	}
@@ -43,6 +46,27 @@ func TestNewReaderRejectsUnsafeConfiguration(t *testing.T) {
 	}, func(context.Context, Transaction) error { return nil })
 	if !errors.Is(err, ErrInvalidReaderConfig) {
 		t.Fatalf("error = %v, want %v", err, ErrInvalidReaderConfig)
+	}
+}
+
+func TestNewReaderRejectsValueLimitLargerThanTransactionLimit(t *testing.T) {
+	_, err := NewReader(ReaderConfig{
+		DatabaseURL:         "postgres://example.invalid/watchd",
+		SlotName:            "watchd_source",
+		PublicationName:     "watchd_publication",
+		MaxTransactionBytes: 1024,
+		MaxValueBytes:       2048,
+	}, func(context.Context, Transaction) error { return nil })
+	if !errors.Is(err, ErrInvalidReaderConfig) {
+		t.Fatalf("error = %v, want %v", err, ErrInvalidReaderConfig)
+	}
+}
+
+func TestValueContractErrorsAreNotRetryable(t *testing.T) {
+	for _, err := range []error{ErrUnsupportedColumnEncoding, ErrValueTooLarge} {
+		if isRetryable(err) {
+			t.Fatalf("isRetryable(%v) = true, want false: a value-contract violation will not resolve itself on reconnect", err)
+		}
 	}
 }
 

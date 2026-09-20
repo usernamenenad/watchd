@@ -29,11 +29,22 @@ var (
 	// projection key. v0 Change has one key, so representing it as an update
 	// would leave an obsolete row in a consumer projection.
 	ErrPrimaryKeyChangeUnsupported = errors.New("cdc: primary-key updates are not supported")
+	// ErrUnsupportedColumnEncoding indicates a pgoutput column whose wire
+	// encoding is not v0's text/null/unchanged-toast value contract (see
+	// "Value encoding" in docs/semantics.md). watchd starts replication
+	// without the pgoutput "binary" option, so this should not occur in
+	// practice; it exists so a protocol-level encoding this decoder cannot
+	// represent is rejected explicitly instead of silently mis-decoded.
+	ErrUnsupportedColumnEncoding = errors.New("cdc: column value is not in the text/null/unchanged-toast wire encoding")
+	// ErrValueTooLarge indicates a single column value exceeds the configured
+	// per-value size bound, independent of the whole-transaction bound.
+	ErrValueTooLarge = errors.New("cdc: column value exceeds configured single-value size limit")
 )
 
 const (
 	defaultMaxTransactionBytes   = 16 << 20
 	defaultMaxTransactionChanges = 100_000
+	defaultMaxValueBytes         = 1 << 20
 )
 
 // Decoder translates pgoutput protocol messages into committed transactions.
@@ -45,29 +56,35 @@ type Decoder struct {
 	pendingBytes          int
 	maxTransactionBytes   int
 	maxTransactionChanges int
+	maxValueBytes         int
 }
 
 // NewDecoder returns a Decoder with no registered relations or pending changes.
 func NewDecoder() *Decoder {
-	return NewDecoderWithLimits(defaultMaxTransactionBytes, defaultMaxTransactionChanges)
+	return NewDecoderWithLimits(defaultMaxTransactionBytes, defaultMaxTransactionChanges, defaultMaxValueBytes)
 }
 
 // NewDecoderWithLimits returns a Decoder whose in-flight transaction is
-// bounded by maxTransactionBytes and maxTransactionChanges. A non-positive
+// bounded by maxTransactionBytes and maxTransactionChanges, and whose
+// individual column values are bounded by maxValueBytes. A non-positive
 // limit selects the package default; Reader configuration rejects invalid
 // limits before creating a decoder.
-func NewDecoderWithLimits(maxTransactionBytes, maxTransactionChanges int) *Decoder {
+func NewDecoderWithLimits(maxTransactionBytes, maxTransactionChanges, maxValueBytes int) *Decoder {
 	if maxTransactionBytes <= 0 {
 		maxTransactionBytes = defaultMaxTransactionBytes
 	}
 	if maxTransactionChanges <= 0 {
 		maxTransactionChanges = defaultMaxTransactionChanges
 	}
+	if maxValueBytes <= 0 {
+		maxValueBytes = defaultMaxValueBytes
+	}
 
 	return &Decoder{
 		relations:             make(map[uint32]*pglogrepl.RelationMessage),
 		maxTransactionBytes:   maxTransactionBytes,
 		maxTransactionChanges: maxTransactionChanges,
+		maxValueBytes:         maxValueBytes,
 	}
 }
 
@@ -163,7 +180,7 @@ func (d *Decoder) insert(message *pglogrepl.InsertMessage) (Change, error) {
 		return Change{}, err
 	}
 
-	values, err := tupleValues(relation, message.Tuple)
+	values, err := tupleValues(relation, message.Tuple, d.maxValueBytes)
 	if err != nil {
 		return Change{}, err
 	}
@@ -187,7 +204,7 @@ func (d *Decoder) update(message *pglogrepl.UpdateMessage) (Change, error) {
 		return Change{}, err
 	}
 
-	values, err := tupleValues(relation, message.NewTuple)
+	values, err := tupleValues(relation, message.NewTuple, d.maxValueBytes)
 	if err != nil {
 		return Change{}, err
 	}
@@ -197,7 +214,7 @@ func (d *Decoder) update(message *pglogrepl.UpdateMessage) (Change, error) {
 		return Change{}, err
 	}
 	if message.OldTuple != nil {
-		oldKey, err := keyFromTuple(relation, message.OldTuple)
+		oldKey, err := keyFromTuple(relation, message.OldTuple, d.maxValueBytes)
 		if err != nil {
 			return Change{}, err
 		}
@@ -220,7 +237,7 @@ func (d *Decoder) delete(message *pglogrepl.DeleteMessage) (Change, error) {
 		return Change{}, err
 	}
 
-	key, err := keyFromTuple(relation, message.OldTuple)
+	key, err := keyFromTuple(relation, message.OldTuple, d.maxValueBytes)
 	if err != nil {
 		return Change{}, err
 	}
@@ -245,7 +262,7 @@ func relationTable(relation *pglogrepl.RelationMessage) string {
 	return qualifiedTable(relation.Namespace, relation.RelationName)
 }
 
-func tupleValues(relation *pglogrepl.RelationMessage, tuple *pglogrepl.TupleData) (map[string]any, error) {
+func tupleValues(relation *pglogrepl.RelationMessage, tuple *pglogrepl.TupleData, maxValueBytes int) (map[string]any, error) {
 	if tuple == nil {
 		return nil, errors.New("cdc: row mutation is missing a tuple")
 	}
@@ -256,13 +273,18 @@ func tupleValues(relation *pglogrepl.RelationMessage, tuple *pglogrepl.TupleData
 
 	values := make(map[string]any, len(tuple.Columns))
 	for index, column := range tuple.Columns {
-		values[relation.Columns[index].Name] = columnValue(column)
+		name := relation.Columns[index].Name
+		value, err := columnValue(column, maxValueBytes)
+		if err != nil {
+			return nil, fmt.Errorf("cdc: decode column %s: %w", name, err)
+		}
+		values[name] = value
 	}
 
 	return values, nil
 }
 
-func keyFromTuple(relation *pglogrepl.RelationMessage, tuple *pglogrepl.TupleData) (map[string]string, error) {
+func keyFromTuple(relation *pglogrepl.RelationMessage, tuple *pglogrepl.TupleData, maxValueBytes int) (map[string]string, error) {
 	if tuple == nil {
 		return nil, errors.New("cdc: delete mutation is missing its replica-identity tuple")
 	}
@@ -275,7 +297,7 @@ func keyFromTuple(relation *pglogrepl.RelationMessage, tuple *pglogrepl.TupleDat
 		// PostgreSQL may send the complete old row (for example with REPLICA
 		// IDENTITY FULL) instead of a key-only tuple. Decode it as normal row
 		// state, then select the configured replica-identity columns.
-		values, err := tupleValues(relation, tuple)
+		values, err := tupleValues(relation, tuple, maxValueBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -287,7 +309,7 @@ func keyFromTuple(relation *pglogrepl.RelationMessage, tuple *pglogrepl.TupleDat
 
 	key := make(map[string]string, len(keyColumns))
 	for index, column := range tuple.Columns {
-		value, err := keyValue(column)
+		value, err := keyValue(column, maxValueBytes)
 		if err != nil {
 			return nil, fmt.Errorf("cdc: decode key %s: %w", keyColumns[index].Name, err)
 		}
@@ -330,32 +352,44 @@ func replicaIdentityColumns(relation *pglogrepl.RelationMessage) []*pglogrepl.Re
 	return keyColumns
 }
 
-func columnValue(column *pglogrepl.TupleDataColumn) any {
+// columnValue decodes one pgoutput column into v0's value contract: a
+// PostgreSQL text-format string, nil for SQL NULL, or UnchangedToast for a
+// TOAST column omitted from an UPDATE. See "Value encoding" in
+// docs/semantics.md. watchd never requests the pgoutput "binary" option, so
+// TupleDataTypeBinary and any other discriminator are rejected rather than
+// passed through as an opaque byte slice - this decoder has no way to
+// represent them under the text/null/unchanged-toast contract, and silently
+// forwarding raw bytes would let a protocol change mis-decode a value
+// instead of failing loudly.
+func columnValue(column *pglogrepl.TupleDataColumn, maxValueBytes int) (any, error) {
 	switch column.DataType {
 
 	case pglogrepl.TupleDataTypeNull:
-		return nil
+		return nil, nil
 
 	case pglogrepl.TupleDataTypeText:
-		return string(column.Data)
-
-	case pglogrepl.TupleDataTypeBinary:
-		return append([]byte(nil), column.Data...)
+		if len(column.Data) > maxValueBytes {
+			return nil, fmt.Errorf("%w: %d bytes exceeds %d-byte limit", ErrValueTooLarge, len(column.Data), maxValueBytes)
+		}
+		return string(column.Data), nil
 
 	case pglogrepl.TupleDataTypeToast:
-		return UnchangedToast{}
+		return UnchangedToast{}, nil
 
 	default:
-		return append([]byte(nil), column.Data...)
+		return nil, fmt.Errorf("%w: discriminator %q", ErrUnsupportedColumnEncoding, column.DataType)
 	}
 }
 
-func keyValue(column *pglogrepl.TupleDataColumn) (string, error) {
+func keyValue(column *pglogrepl.TupleDataColumn, maxValueBytes int) (string, error) {
 	if column.DataType != pglogrepl.TupleDataTypeText {
-		return "", fmt.Errorf("key is not text (type %q)", column.DataType)
+		return "", fmt.Errorf("%w: key is not text (type %q)", ErrUnsupportedColumnEncoding, column.DataType)
 	}
 	if len(column.Data) == 0 {
 		return "", errors.New("key is empty")
+	}
+	if len(column.Data) > maxValueBytes {
+		return "", fmt.Errorf("%w: %d bytes exceeds %d-byte limit", ErrValueTooLarge, len(column.Data), maxValueBytes)
 	}
 
 	return string(column.Data), nil
@@ -383,8 +417,6 @@ func estimatedValueBytes(value any) int {
 	case nil:
 		return 1
 	case string:
-		return len(value)
-	case []byte:
 		return len(value)
 	case UnchangedToast:
 		return 1

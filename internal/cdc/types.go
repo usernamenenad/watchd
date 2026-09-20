@@ -19,8 +19,16 @@ const (
 // Change is one row mutation from a PostgreSQL projection table.
 //
 // Key contains the stable replica-identity columns needed to identify a row.
-// Values contains the resulting row state for inserts and updates. A value can
-// be a string, nil (SQL NULL), []byte, or UnchangedToast.
+// A replica-identity column is always sent in full by PostgreSQL, so every
+// Key entry is a non-empty PostgreSQL text value - never NULL, never
+// TOAST-omitted, and never absent. Values contains the resulting row state
+// for inserts and updates. Every value is one of: a string holding the
+// column's PostgreSQL text representation (the same text `column::text`
+// would produce, for every column type including bytea, arrays, composite
+// types, json/jsonb, enums, and domain types - watchd does not request
+// pgoutput's binary option, so encoding is uniform across types), nil for
+// SQL NULL, or UnchangedToast for a TOAST column omitted from an UPDATE
+// because it did not change. See "Value encoding" in docs/semantics.md.
 type Change struct {
 	Operation string
 	Table     string
