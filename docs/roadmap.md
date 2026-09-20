@@ -1,5 +1,7 @@
 # Roadmap
 
+Stages 2 and 3 are what the first tagged release covers. [The 0.1.0 release plan](release-0.1.0.md) names the blocking issues, the deliberate deferrals, and the order the work lands in.
+
 ## 0. Contract and discovery
 
 Write the precise Watch, Progress, and Resync contract; validate the problem with teams operating Postgres-backed caches or read models.

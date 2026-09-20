@@ -39,7 +39,7 @@ It listens on `127.0.0.1:54329` and is configured for logical replication. See [
 - `tests/` — integration and fault-test suites
 - `examples/` — runnable reference setups
 
-See [the roadmap](docs/roadmap.md) and the [v0 semantics contract](docs/semantics.md).
+See [the roadmap](docs/roadmap.md), the [v0 semantics contract](docs/semantics.md), and the [0.1.0 release plan](docs/release-0.1.0.md).
 
 ## Contributing
 
