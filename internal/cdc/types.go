@@ -1,6 +1,14 @@
 package cdc
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+
+	"github.com/jackc/pglogrepl"
+)
+
+// ErrNoCursors indicates that MinCursor was called with no cursors to compare.
+var ErrNoCursors = errors.New("cdc: no cursors to compare")
 
 const (
 	OperationInsert = "insert"
@@ -42,12 +50,74 @@ type Scope struct {
 	Value string
 }
 
+// Cursor is a source commit position. Cursors from the same source are
+// totally ordered and safe to compare; the underlying representation stays
+// opaque to callers, who must go through Compare/MinCursor rather than
+// parsing String's output.
+type Cursor struct {
+	sourceID string
+	lsn      pglogrepl.LSN
+}
+
+// Compare reports whether c precedes (-1), equals (0), or follows (1) other.
+// It returns an error if c and other belong to different sources, since v0
+// makes no ordering claim across sources.
+func (c Cursor) Compare(other Cursor) (int, error) {
+	if c.sourceID != other.sourceID {
+		return 0, fmt.Errorf("cdc: cannot compare cursors from different sources (%q, %q)", c.sourceID, other.sourceID)
+	}
+
+	switch {
+	case c.lsn < other.lsn:
+		return -1, nil
+	case c.lsn > other.lsn:
+		return 1, nil
+	default:
+		return 0, nil
+	}
+}
+
+// IsZero reports whether c is the zero Cursor, i.e. it was never assigned
+// from a Snapshot or Transaction.
+func (c Cursor) IsZero() bool {
+	return c == Cursor{}
+}
+
+// String returns Cursor's opaque persisted form. Callers must persist and
+// return it verbatim; they must not derive meaning from its contents.
+func (c Cursor) String() string {
+	return c.lsn.String()
+}
+
+// MinCursor returns the earliest of cursors. Given the progress cursors of
+// several scopes of one source, the result is the consistent-cut boundary:
+// a client may treat it as a snapshot-consistent state across those scopes.
+// It returns an error if cursors is empty or spans more than one source.
+func MinCursor(cursors ...Cursor) (Cursor, error) {
+	if len(cursors) == 0 {
+		return Cursor{}, ErrNoCursors
+	}
+
+	min := cursors[0]
+	for _, cursor := range cursors[1:] {
+		cmp, err := min.Compare(cursor)
+		if err != nil {
+			return Cursor{}, err
+		}
+		if cmp > 0 {
+			min = cursor
+		}
+	}
+
+	return min, nil
+}
+
 // Snapshot is a consistent scoped read paired with the opaque cursor at
 // which replication must resume. Like Change.Values, row values are their
 // PostgreSQL text representation or nil for SQL NULL.
 type Snapshot struct {
 	SourceID string
-	Cursor   string
+	Cursor   Cursor
 	Rows     []map[string]any
 }
 
