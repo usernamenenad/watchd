@@ -453,7 +453,7 @@ func newIntegrationReaderWithRetry(t *testing.T, slotName string, sink cdc.Trans
 func bootstrapReader(t *testing.T, ctx context.Context, reader *cdc.Reader) {
 	t.Helper()
 
-	snapshot, err := reader.Bootstrap(ctx, integrationProjectionSpec(), cdc.Scope{Value: "00000000-0000-0000-0000-000000000001"})
+	snapshot, err := reader.Bootstrap(ctx, integrationProjectionSpec(), cdc.Scope{Value: "00000000-0000-0000-0000-000000000001"}, func(context.Context, []map[string]any) error { return nil })
 	if err != nil {
 		t.Fatalf("bootstrap replication source: %v", err)
 	}

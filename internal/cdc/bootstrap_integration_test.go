@@ -68,12 +68,14 @@ func TestBootstrapIsGapFreeAcrossConcurrentWrites(t *testing.T) {
 
 	type bootstrapResult struct {
 		snapshot Snapshot
+		rows     []map[string]any
 		err      error
 	}
 	bootstrapDone := make(chan bootstrapResult, 1)
 	go func() {
-		snapshot, err := reader.Bootstrap(ctx, bootstrapTestProjection(), Scope{Value: tenantID})
-		bootstrapDone <- bootstrapResult{snapshot: snapshot, err: err}
+		var rows []map[string]any
+		snapshot, err := reader.Bootstrap(ctx, bootstrapTestProjection(), Scope{Value: tenantID}, collectSnapshotRows(&rows))
+		bootstrapDone <- bootstrapResult{snapshot: snapshot, rows: rows, err: err}
 	}()
 
 	select {
@@ -90,7 +92,7 @@ func TestBootstrapIsGapFreeAcrossConcurrentWrites(t *testing.T) {
 	if bootstrap.err != nil {
 		t.Fatalf("bootstrap: %v", bootstrap.err)
 	}
-	projection := projectionFromBootstrapSnapshot(t, bootstrap.snapshot, tenantID)
+	projection := projectionFromBootstrapSnapshot(t, bootstrap.rows, tenantID)
 
 	runCtx, stop := context.WithCancel(ctx)
 	runDone := make(chan error, 1)
@@ -139,7 +141,7 @@ func TestBootstrapCancellationCleansUpSlotAndTransaction(t *testing.T) {
 	bootstrapCtx, cancelBootstrap := context.WithCancel(ctx)
 	result := make(chan error, 1)
 	go func() {
-		_, err := reader.Bootstrap(bootstrapCtx, bootstrapTestProjection(), Scope{Value: "00000000-0000-0000-0000-000000000001"})
+		_, err := reader.Bootstrap(bootstrapCtx, bootstrapTestProjection(), Scope{Value: "00000000-0000-0000-0000-000000000001"}, func(context.Context, []map[string]any) error { return nil })
 		result <- err
 	}()
 
@@ -291,10 +293,20 @@ func writeAfterBootstrapTest(ctx context.Context, conn *pgx.Conn, tenantID, dele
 	return tx.Commit(ctx)
 }
 
-func projectionFromBootstrapSnapshot(t *testing.T, snapshot Snapshot, tenantID string) bootstrapProjection {
+// collectSnapshotRows returns a SnapshotRowSink that appends every batch it
+// receives into rows, so tests can assert on the full scoped read the way
+// they did when Snapshot/Bootstrap returned Rows directly.
+func collectSnapshotRows(rows *[]map[string]any) SnapshotRowSink {
+	return func(_ context.Context, batch []map[string]any) error {
+		*rows = append(*rows, batch...)
+		return nil
+	}
+}
+
+func projectionFromBootstrapSnapshot(t *testing.T, rows []map[string]any, tenantID string) bootstrapProjection {
 	t.Helper()
-	state := make(bootstrapProjection, len(snapshot.Rows))
-	for _, row := range snapshot.Rows {
+	state := make(bootstrapProjection, len(rows))
+	for _, row := range rows {
 		if bootstrapString(t, row["tenant_id"]) != tenantID {
 			t.Fatalf("snapshot included row outside scope: %v", row)
 		}

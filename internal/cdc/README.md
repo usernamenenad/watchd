@@ -53,11 +53,8 @@ snapshot, err := reader.Bootstrap(ctx, cdc.ProjectionSpec{
     Table:       "tenant_permissions_projection",
     ScopeColumn: "tenant_id",
     PrimaryKey:  []string{"tenant_id", "user_id"},
-}, cdc.Scope{Value: tenantID})
+}, cdc.Scope{Value: tenantID}, installSnapshotBatch)
 if err != nil {
-    return err
-}
-if err := installSnapshotAtomically(snapshot); err != nil {
     return err
 }
 
@@ -68,3 +65,8 @@ return reader.Run(ctx)
 the snapshot; `Run` consumes that already-started stream. A later recovery
 with an existing usable slot calls `Run` directly; it never creates a missing
 slot.
+
+`Bootstrap` and `Snapshot` deliver scoped rows to a `cdc.SnapshotRowSink`
+in primary-key-ordered batches (`ReaderConfig.SnapshotBatchRows`, default
+1000) instead of returning them all at once, so a very large scope never
+has to be held fully in memory.
