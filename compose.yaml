@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    image: ${WATCHD_POSTGRES_IMAGE:-postgres:17-alpine}
     environment:
       POSTGRES_DB: watchd
       POSTGRES_USER: postgres

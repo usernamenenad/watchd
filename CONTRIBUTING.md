@@ -21,12 +21,35 @@ Requirements:
 Start PostgreSQL and run all current checks:
 
 ```bash
+make fmt-check
+make vet
 make postgres-up
 make test
 make integration
+make vulncheck   # requires golang.org/x/vuln/cmd/govulncheck
 ```
 
 Reset the disposable local database with `make postgres-down`. This removes the development volume.
+
+## Continuous integration
+
+CI (`.github/workflows/ci.yml`) runs the same `make` targets used locally, so a
+clean checkout behaves the same in both places:
+
+- `fmt-check` and `vet` gate every push and pull request.
+- Unit tests run with the race detector and publish a coverage report; the
+  percentage is informational, not a pass/fail gate.
+- Integration tests run against `postgres:15-alpine`, `postgres:16-alpine`,
+  and `postgres:17-alpine` on Linux amd64, matching this project's
+  currently-supported PostgreSQL range. Add a version to the matrix in
+  `ci.yml` when the project commits to supporting it, and drop one once it is
+  end-of-life upstream. Additional platforms (architectures, OSes) are out of
+  scope until a concrete deployment target needs them.
+- `govulncheck` scans for known vulnerabilities on every push and pull
+  request.
+
+Required checks are enabled on `main` and `develop` once these workflows have
+proven stable.
 
 ## Branches
 
