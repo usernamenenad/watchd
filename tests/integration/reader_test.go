@@ -457,7 +457,7 @@ func bootstrapReader(t *testing.T, ctx context.Context, reader *cdc.Reader) {
 	if err != nil {
 		t.Fatalf("bootstrap replication source: %v", err)
 	}
-	if snapshot.Cursor == "" {
+	if snapshot.Cursor.IsZero() {
 		t.Fatalf("bootstrap snapshot = %#v, want a consistent cursor", snapshot)
 	}
 }

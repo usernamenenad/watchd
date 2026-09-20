@@ -235,8 +235,11 @@ func (r *Reader) Snapshot(ctx context.Context, spec ProjectionSpec, scope Scope)
 
 	return Snapshot{
 		SourceID: spec.SourceID,
-		Cursor:   cursor.String(),
-		Rows:     rows,
+		Cursor: Cursor{
+			sourceID: spec.SourceID,
+			lsn:      cursor,
+		},
+		Rows: rows,
 	}, nil
 }
 
@@ -270,7 +273,7 @@ func (r *Reader) checkReplayWindow(ctx context.Context, management *pgx.Conn, cu
 // Bootstrap deliberately refuses an existing slot: reusing one would mean
 // reading against a source history whose starting point this call never
 // established, so it cannot vouch for a gap-free boundary.
-func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope) (snapshot Snapshot, err error) {
+func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope) (Snapshot, error) {
 	if err := validateProjectionSpecConfig(spec); err != nil {
 		return Snapshot{}, err
 	}
@@ -332,8 +335,11 @@ func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope
 
 	return Snapshot{
 		SourceID: spec.SourceID,
-		Cursor:   cursor.String(),
-		Rows:     rows,
+		Cursor: Cursor{
+			sourceID: spec.SourceID,
+			lsn:      cursor,
+		},
+		Rows: rows,
 	}, nil
 }
 

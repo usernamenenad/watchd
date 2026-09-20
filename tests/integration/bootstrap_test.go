@@ -131,7 +131,7 @@ func TestReaderBootstrapReturnsScopedSnapshotAndRetainsStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
-	if snapshot.SourceID != "test-postgres" || snapshot.Cursor == "" {
+	if snapshot.SourceID != "test-postgres" || snapshot.Cursor.IsZero() {
 		t.Fatalf("snapshot metadata = %#v, want source identity and cursor", snapshot)
 	}
 	if got, want := len(snapshot.Rows), 1; got != want {
