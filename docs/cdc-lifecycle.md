@@ -92,7 +92,7 @@ type Snapshot struct {
 }
 ```
 
-`Rows` are the initial rows to install locally. `Cursor` is the WAL boundary that pairs that row set with the later live stream. The values are returned in PostgreSQL text form (or `nil`) so that the snapshot and logical-decoding path use compatible representations.
+`Rows` are the initial rows to install locally. `Cursor` is the WAL boundary that pairs that row set with the later live stream. The values are returned in PostgreSQL text form (or `nil`) so that the snapshot and logical-decoding path use compatible representations - see "Value encoding" in [the v0 semantics contract](semantics.md) for the full rules and size limits.
 
 ### Exported snapshot
 

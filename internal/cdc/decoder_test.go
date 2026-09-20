@@ -140,7 +140,7 @@ func TestDecoderRejectsUnsupportedProjectionMutation(t *testing.T) {
 }
 
 func TestDecoderEnforcesTransactionLimits(t *testing.T) {
-	decoder := NewDecoderWithLimits(1024, 1)
+	decoder := NewDecoderWithLimits(1024, 1, 0)
 	relation := sampleRelation()
 	mustConsume(t, decoder, relation)
 	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
@@ -157,7 +157,7 @@ func TestDecoderEnforcesTransactionLimits(t *testing.T) {
 		t.Fatalf("error = %v, want %v", err, ErrTransactionTooManyChanges)
 	}
 
-	tooSmall := NewDecoderWithLimits(1, 10)
+	tooSmall := NewDecoderWithLimits(1, 10, 0)
 	mustConsume(t, tooSmall, relation)
 	mustConsume(t, tooSmall, &pglogrepl.BeginMessage{})
 	_, err = tooSmall.Consume(&pglogrepl.InsertMessage{
@@ -166,6 +166,96 @@ func TestDecoderEnforcesTransactionLimits(t *testing.T) {
 	})
 	if !errors.Is(err, ErrTransactionTooLarge) {
 		t.Fatalf("error = %v, want %v", err, ErrTransactionTooLarge)
+	}
+}
+
+func TestDecoderDistinguishesNullFromUnchangedToast(t *testing.T) {
+	decoder := NewDecoder()
+	relation := sampleRelation()
+	mustConsume(t, decoder, relation)
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+	mustConsume(t, decoder, &pglogrepl.InsertMessage{
+		RelationID: relation.RelationID,
+		Tuple: &pglogrepl.TupleData{Columns: []*pglogrepl.TupleDataColumn{
+			textColumn("acme"),
+			textColumn("alice"),
+			nullColumn(),
+		}},
+	})
+	mustConsume(t, decoder, &pglogrepl.UpdateMessage{
+		RelationID: relation.RelationID,
+		NewTuple: &pglogrepl.TupleData{Columns: []*pglogrepl.TupleDataColumn{
+			textColumn("acme"),
+			textColumn("bob"),
+			toastColumn(),
+		}},
+	})
+
+	transaction, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 45})
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	insertValue := transaction.Changes[0].Values["permissions"]
+	if insertValue != nil {
+		t.Fatalf("null value = %#v, want nil", insertValue)
+	}
+
+	updateValue := transaction.Changes[1].Values["permissions"]
+	if _, ok := updateValue.(UnchangedToast); !ok {
+		t.Fatalf("unchanged-toast value = %#v (%T), want UnchangedToast", updateValue, updateValue)
+	}
+	if updateValue == nil {
+		t.Fatalf("unchanged-toast value must not equal nil")
+	}
+}
+
+func TestDecoderRejectsUnsupportedColumnEncoding(t *testing.T) {
+	decoder := NewDecoder()
+	relation := sampleRelation()
+	mustConsume(t, decoder, relation)
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+
+	_, err := decoder.Consume(&pglogrepl.InsertMessage{
+		RelationID: relation.RelationID,
+		Tuple: &pglogrepl.TupleData{Columns: []*pglogrepl.TupleDataColumn{
+			textColumn("acme"),
+			textColumn("alice"),
+			binaryColumn([]byte{0x01, 0x02}),
+		}},
+	})
+	if !errors.Is(err, ErrUnsupportedColumnEncoding) {
+		t.Fatalf("error = %v, want %v", err, ErrUnsupportedColumnEncoding)
+	}
+}
+
+func TestDecoderRejectsOversizedValue(t *testing.T) {
+	decoder := NewDecoderWithLimits(1<<20, 100, 4)
+	relation := sampleRelation()
+	mustConsume(t, decoder, relation)
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+
+	_, err := decoder.Consume(&pglogrepl.InsertMessage{
+		RelationID: relation.RelationID,
+		Tuple:      fullTuple("acme", "alice", "way-too-long-for-the-limit"),
+	})
+	if !errors.Is(err, ErrValueTooLarge) {
+		t.Fatalf("error = %v, want %v", err, ErrValueTooLarge)
+	}
+}
+
+func TestDecoderRejectsOversizedKeyValue(t *testing.T) {
+	decoder := NewDecoderWithLimits(1<<20, 100, 4)
+	relation := sampleRelation()
+	mustConsume(t, decoder, relation)
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+
+	_, err := decoder.Consume(&pglogrepl.DeleteMessage{
+		RelationID: relation.RelationID,
+		OldTuple:   keyTuple("way-too-long-tenant", "bob"),
+	})
+	if !errors.Is(err, ErrValueTooLarge) {
+		t.Fatalf("error = %v, want %v", err, ErrValueTooLarge)
 	}
 }
 
@@ -199,6 +289,18 @@ func keyTuple(tenantID, userID string) *pglogrepl.TupleData {
 
 func textColumn(value string) *pglogrepl.TupleDataColumn {
 	return &pglogrepl.TupleDataColumn{DataType: pglogrepl.TupleDataTypeText, Data: []byte(value)}
+}
+
+func nullColumn() *pglogrepl.TupleDataColumn {
+	return &pglogrepl.TupleDataColumn{DataType: pglogrepl.TupleDataTypeNull}
+}
+
+func toastColumn() *pglogrepl.TupleDataColumn {
+	return &pglogrepl.TupleDataColumn{DataType: pglogrepl.TupleDataTypeToast}
+}
+
+func binaryColumn(data []byte) *pglogrepl.TupleDataColumn {
+	return &pglogrepl.TupleDataColumn{DataType: pglogrepl.TupleDataTypeBinary, Data: data}
 }
 
 func mustConsume(t *testing.T, decoder *Decoder, message pglogrepl.Message) {

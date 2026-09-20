@@ -103,9 +103,12 @@ type ReaderConfig struct {
 	PublicationName string
 
 	// MaxTransactionBytes and MaxTransactionChanges bound the memory retained
-	// for one uncommitted source transaction.
+	// for one uncommitted source transaction. MaxValueBytes bounds a single
+	// column value independent of the whole-transaction bound; it must not
+	// exceed MaxTransactionBytes.
 	MaxTransactionBytes   int
 	MaxTransactionChanges int
+	MaxValueBytes         int
 	// ConnectionTimeout bounds each new PostgreSQL replication or management
 	// connection attempt. It does not bound an already-running stream.
 	ConnectionTimeout time.Duration
@@ -389,7 +392,7 @@ func (r *Reader) read(ctx context.Context) error {
 	if stream, startLSN, ok := r.takeBootstrapStream(); ok {
 		defer r.closeReplicationConnection(stream)
 		r.setConnectionState("streaming")
-		decoder := NewDecoderWithLimits(r.config.MaxTransactionBytes, r.config.MaxTransactionChanges)
+		decoder := NewDecoderWithLimits(r.config.MaxTransactionBytes, r.config.MaxTransactionChanges, r.config.MaxValueBytes)
 		return r.receive(ctx, stream.Conn(), decoder, startLSN)
 	}
 
@@ -411,7 +414,7 @@ func (r *Reader) read(ctx context.Context) error {
 
 	r.log(ctx, slog.LevelInfo, "PostgreSQL logical replication started", "slot", r.config.SlotName, "start_lsn", startLSN.String())
 	r.setConnectionState("streaming")
-	decoder := NewDecoderWithLimits(r.config.MaxTransactionBytes, r.config.MaxTransactionChanges)
+	decoder := NewDecoderWithLimits(r.config.MaxTransactionBytes, r.config.MaxTransactionChanges, r.config.MaxValueBytes)
 	return r.receive(ctx, conn, decoder, startLSN)
 }
 
@@ -998,6 +1001,9 @@ func normalizeReaderConfig(config ReaderConfig) ReaderConfig {
 	if config.MaxTransactionChanges == 0 {
 		config.MaxTransactionChanges = defaultMaxTransactionChanges
 	}
+	if config.MaxValueBytes == 0 {
+		config.MaxValueBytes = defaultMaxValueBytes
+	}
 	if config.ConnectionTimeout == 0 {
 		config.ConnectionTimeout = defaultConnectionTimeout
 	}
@@ -1029,8 +1035,11 @@ func validateReaderConfig(config ReaderConfig, sink TransactionSink) error {
 	if !postgresIdentifier.MatchString(config.SlotName) || !postgresIdentifier.MatchString(config.PublicationName) {
 		return fmt.Errorf("%w: slot and publication names must be unquoted PostgreSQL identifiers", ErrInvalidReaderConfig)
 	}
-	if config.MaxTransactionBytes <= 0 || config.MaxTransactionChanges <= 0 || config.ConnectionTimeout <= 0 || config.StatusInterval <= 0 || config.ShutdownTimeout <= 0 {
+	if config.MaxTransactionBytes <= 0 || config.MaxTransactionChanges <= 0 || config.MaxValueBytes <= 0 || config.ConnectionTimeout <= 0 || config.StatusInterval <= 0 || config.ShutdownTimeout <= 0 {
 		return ErrInvalidReaderConfig
+	}
+	if config.MaxValueBytes > config.MaxTransactionBytes {
+		return fmt.Errorf("%w: MaxValueBytes must not exceed MaxTransactionBytes", ErrInvalidReaderConfig)
 	}
 	if config.RetryPolicy.InitialBackoff <= 0 || config.RetryPolicy.MaxBackoff < config.RetryPolicy.InitialBackoff || config.RetryPolicy.MaxAttempts < 0 || config.RetryPolicy.Jitter < 0 || config.RetryPolicy.Jitter > 1 {
 		return ErrInvalidReaderConfig
@@ -1052,6 +1061,8 @@ func isRetryable(err error) bool {
 		!errors.Is(err, ErrTransactionTooLarge) &&
 		!errors.Is(err, ErrTransactionTooManyChanges) &&
 		!errors.Is(err, ErrUnsupportedPGOutputMessage) &&
+		!errors.Is(err, ErrUnsupportedColumnEncoding) &&
+		!errors.Is(err, ErrValueTooLarge) &&
 		!errors.Is(err, ErrSinkRejected)
 }
 
