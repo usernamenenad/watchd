@@ -212,6 +212,7 @@ func (r *Reader) consumeCopyData(
 			return fmt.Errorf("%w: decoder emitted a transaction without a commit end LSN", ErrMalformedReplicationData)
 		}
 		r.incrementTransactionsReceived()
+		transaction.Cursor.sourceID = r.config.SourceID
 
 		// A nil sink result is the local replay-buffer acceptance boundary. If it
 		// fails, safeLSN must not move and PostgreSQL will replay this batch.

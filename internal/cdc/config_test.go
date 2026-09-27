@@ -9,6 +9,7 @@ import (
 func TestNewReaderAppliesSafeDefaults(t *testing.T) {
 	reader, err := NewReader(ReaderConfig{
 		DatabaseURL:     "postgres://example.invalid/watchd",
+		SourceID:        "test-postgres",
 		SlotName:        "watchd_source",
 		PublicationName: "watchd_publication",
 	}, func(context.Context, Transaction) error { return nil })
@@ -42,6 +43,7 @@ func TestNewReaderAppliesSafeDefaults(t *testing.T) {
 func TestNewReaderRejectsUnsafeConfiguration(t *testing.T) {
 	_, err := NewReader(ReaderConfig{
 		DatabaseURL:     "postgres://example.invalid/watchd",
+		SourceID:        "test-postgres",
 		SlotName:        "watchd-source; DROP TABLE users",
 		PublicationName: "watchd_publication",
 	}, func(context.Context, Transaction) error { return nil })
@@ -53,10 +55,22 @@ func TestNewReaderRejectsUnsafeConfiguration(t *testing.T) {
 func TestNewReaderRejectsValueLimitLargerThanTransactionLimit(t *testing.T) {
 	_, err := NewReader(ReaderConfig{
 		DatabaseURL:         "postgres://example.invalid/watchd",
+		SourceID:            "test-postgres",
 		SlotName:            "watchd_source",
 		PublicationName:     "watchd_publication",
 		MaxTransactionBytes: 1024,
 		MaxValueBytes:       2048,
+	}, func(context.Context, Transaction) error { return nil })
+	if !errors.Is(err, ErrInvalidReaderConfig) {
+		t.Fatalf("error = %v, want %v", err, ErrInvalidReaderConfig)
+	}
+}
+
+func TestNewReaderRequiresSourceID(t *testing.T) {
+	_, err := NewReader(ReaderConfig{
+		DatabaseURL:     "postgres://example.invalid/watchd",
+		SlotName:        "watchd_source",
+		PublicationName: "watchd_publication",
 	}, func(context.Context, Transaction) error { return nil })
 	if !errors.Is(err, ErrInvalidReaderConfig) {
 		t.Fatalf("error = %v, want %v", err, ErrInvalidReaderConfig)

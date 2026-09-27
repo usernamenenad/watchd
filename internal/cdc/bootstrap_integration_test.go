@@ -173,6 +173,7 @@ func newBootstrapTestReader(t *testing.T, slotName string, sink TransactionSink)
 	t.Helper()
 	reader, err := NewReader(ReaderConfig{
 		DatabaseURL:     testReplicationURL,
+		SourceID:        "test-postgres",
 		SlotName:        slotName,
 		PublicationName: testPublication,
 		StatusInterval:  100 * time.Millisecond,

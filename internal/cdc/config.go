@@ -34,6 +34,9 @@ type ReaderConfig struct {
 	// DatabaseURL is a normal PostgreSQL URL. The reader adds replication mode
 	// for its streaming connection and removes it for management queries.
 	DatabaseURL string
+	// SourceID names this source. Every cursor the reader produces carries
+	// it, so cursors from different sources are never compared by mistake.
+	SourceID string
 	// SlotName names the persistent PostgreSQL logical replication slot.
 	SlotName string
 	// PublicationName is the single v0 PostgreSQL publication to stream.
@@ -121,7 +124,7 @@ func normalizeReaderConfig(config ReaderConfig) ReaderConfig {
 }
 
 func validateReaderConfig(config ReaderConfig, sink TransactionSink) error {
-	if config.DatabaseURL == "" || config.SlotName == "" || config.PublicationName == "" || sink == nil {
+	if config.DatabaseURL == "" || config.SourceID == "" || config.SlotName == "" || config.PublicationName == "" || sink == nil {
 		return ErrInvalidReaderConfig
 	}
 	if !postgresIdentifier.MatchString(config.SlotName) || !postgresIdentifier.MatchString(config.PublicationName) {

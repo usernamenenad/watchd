@@ -10,6 +10,7 @@ func newUnitReader(t *testing.T) *Reader {
 
 	reader, err := NewReader(ReaderConfig{
 		DatabaseURL:     "postgres://example.invalid/watchd",
+		SourceID:        "test-postgres",
 		SlotName:        "watchd_source",
 		PublicationName: "watchd_publication",
 	}, func(context.Context, Transaction) error { return nil })

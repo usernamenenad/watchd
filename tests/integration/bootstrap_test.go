@@ -229,6 +229,7 @@ func TestReaderBootstrapClassifiesInsufficientReplicationPrivilege(t *testing.T)
 	slotName := fmt.Sprintf("watchd_bootstrap_permission_%d", time.Now().UnixNano())
 	reader, err := cdc.NewReader(cdc.ReaderConfig{
 		DatabaseURL:     envOrDefault("WATCHD_TEST_DATABASE_URL", defaultDatabaseURL),
+		SourceID:        "test-postgres",
 		SlotName:        slotName,
 		PublicationName: publicationName,
 	}, func(context.Context, cdc.Transaction) error { return nil })
@@ -249,6 +250,7 @@ func TestReaderBootstrapRejectsInvalidPublication(t *testing.T) {
 	slotName := fmt.Sprintf("watchd_bootstrap_bad_publication_%d", time.Now().UnixNano())
 	reader, err := cdc.NewReader(cdc.ReaderConfig{
 		DatabaseURL:     envOrDefault("WATCHD_TEST_REPLICATION_URL", defaultReplicationURL),
+		SourceID:        "test-postgres",
 		SlotName:        slotName,
 		PublicationName: "missing_publication",
 	}, func(context.Context, cdc.Transaction) error { return nil })

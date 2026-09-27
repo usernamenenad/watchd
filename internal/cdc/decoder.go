@@ -53,6 +53,7 @@ const (
 type Decoder struct {
 	relations             map[uint32]*pglogrepl.RelationMessage
 	pending               []Change
+	pendingXid            uint32
 	pendingBytes          int
 	maxTransactionBytes   int
 	maxTransactionChanges int
@@ -101,6 +102,7 @@ func (d *Decoder) Consume(message pglogrepl.Message) (*Transaction, error) {
 			return nil, ErrTransactionInProgress
 		}
 		d.pending = make([]Change, 0)
+		d.pendingXid = message.Xid
 		d.pendingBytes = 0
 		return nil, nil
 
@@ -129,9 +131,13 @@ func (d *Decoder) Consume(message pglogrepl.Message) (*Transaction, error) {
 		if d.pending == nil {
 			return nil, ErrNoTransaction
 		}
+		// The Decoder does not know which source it reads; the Reader stamps
+		// the cursor's source ID before handing the transaction to its sink.
 		transaction := &Transaction{
-			Cursor:  message.CommitLSN.String(),
-			Changes: append([]Change(nil), d.pending...),
+			Cursor:    Cursor{lsn: message.TransactionEndLSN},
+			Changes:   append([]Change(nil), d.pending...),
+			commitLSN: message.CommitLSN,
+			xid:       d.pendingXid,
 		}
 		d.pending = nil
 		d.pendingBytes = 0

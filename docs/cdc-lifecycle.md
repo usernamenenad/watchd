@@ -46,6 +46,8 @@ An LSN (log sequence number) identifies a position in the WAL. In watchd code an
 
 “Resume from cursor `P`” means “give me every committed change after position `P`.”
 
+Every cursor carries the ID of the source it came from, and cursors from different sources cannot be compared. A committed transaction's cursor is the position just after its commit: the position watchd acknowledges to PostgreSQL once the sink accepts the transaction, and the one a consumer persists after applying it. `Transaction.After(cursor)` tells a consumer resuming from a cursor whether it still has to apply a transaction; it uses the same rule PostgreSQL applies to a replication start position.
+
 ### Projection
 
 A projection is the local data set watchd maintains from a source table. It is usually a subset of a source table, stored or exposed in a form that the local application can use efficiently.
@@ -62,7 +64,9 @@ type ProjectionSpec struct {
 }
 ```
 
-`SourceID` names this configured source. `Schema` and `Table` select the PostgreSQL table. `ScopeColumn` is the column used to divide the table into tenants, accounts, workspaces, or another unit of ownership. `PrimaryKey` is the ordered list of primary-key columns that identifies a row reliably, so updates and deletes can be applied to the correct local row.
+`SourceID` names this configured source and must match the reader's `ReaderConfig.SourceID`. `Schema` and `Table` select the PostgreSQL table. `ScopeColumn` is the column used to divide the table into tenants, accounts, workspaces, or another unit of ownership. `PrimaryKey` is the ordered list of primary-key columns that identifies a row reliably, so updates and deletes can be applied to the correct local row.
+
+`ScopeColumn` must be one of the `PrimaryKey` columns. With PostgreSQL's default replica identity, a `DELETE` carries only the primary key, so a scope column outside it would leave a delete impossible to route to the scope that holds the row.
 
 ### Scope
 
@@ -85,18 +89,26 @@ A snapshot is a consistent, point-in-time read of rows. It answers: “what did 
 watchd returns:
 
 ```go
-type Snapshot struct {
-    SourceID string
-    Cursor   string
-    Rows     []map[string]any
-}
+snapshot, err := reader.Snapshot(ctx, projection, scope, func(ctx context.Context, rows []map[string]any) error {
+    return installRows(ctx, rows) // called once per primary-key-ordered batch
+})
+// snapshot.Cursor:            where the live stream takes over
+// snapshot.Covers(transaction): whether a streamed transaction is already in the rows
 ```
 
-`Rows` are the initial rows to install locally. `Cursor` is the WAL boundary that pairs that row set with the later live stream. The values are returned in PostgreSQL text form (or `nil`) so that the snapshot and logical-decoding path use compatible representations - see "Value encoding" in [the v0 semantics contract](semantics.md) for the full rules and size limits.
+Rows are not returned all at once. They are delivered to a `SnapshotRowSink` in primary-key-ordered batches of at most `ReaderConfig.SnapshotBatchRows` (default 1000), so a large scope is never held in memory whole. The values are PostgreSQL text form (or `nil`) so that the snapshot and logical-decoding paths use compatible representations - see "Value encoding" in [the v0 semantics contract](semantics.md) for the full rules and size limits.
+
+The returned `Snapshot` pairs those rows with the live stream in two ways. `Cursor` is the WAL position where the stream takes over, and the position a consumer persists until it applies a later transaction. `Covers(transaction)` answers, exactly, whether a streamed transaction's effects are already in the rows.
+
+### MVCC snapshot and transaction visibility
+
+A repeatable-read transaction reads the database as of one instant: its MVCC snapshot. PostgreSQL describes that snapshot with `pg_current_snapshot()` as `xmin:xmax:in-progress-list`. Every transaction ID below `xmin` had finished, every ID at or above `xmax` had not, and the list names the ones in between that were still running. A committed transaction is in the snapshot's rows exactly when it had finished by then.
+
+watchd records this for every scoped read, and `Snapshot.Covers` checks a streamed transaction's ID against it. The decision is made by transaction ID rather than by WAL position on purpose: a transaction can commit between the moment a snapshot is fixed and the moment any WAL position is read, and then it is invisible to the rows while its commit position looks "before" the boundary. Comparing positions alone silently loses such a transaction; comparing transaction IDs cannot.
 
 ### Exported snapshot
 
-`pg_export_snapshot()` pins the calling transaction's repeatable-read snapshot to a definite, nameable instant. watchd does not use it to hand a snapshot to another connection; it uses it as a synchronization point within the same transaction, immediately followed by `pg_current_wal_lsn()`. That guarantees the recorded WAL position is at or after everything the snapshot can see, which is what makes a scoped read's rows and its resume cursor a matched, gap-free pair.
+`CREATE_REPLICATION_SLOT ... EXPORT_SNAPSHOT` makes PostgreSQL create a logical slot and, at the same time, export an MVCC snapshot that matches the slot's *consistent point* exactly: every transaction that commits before the consistent point is visible in it, and the slot decodes every transaction that commits after it. Another session can adopt it with `SET TRANSACTION SNAPSHOT`, which `Bootstrap` does to read the first scope. The exported snapshot is only valid until the replication connection that created it runs another command.
 
 ### Sink
 
@@ -139,16 +151,18 @@ Together those two halves cover the whole history. This is a **gap-free snapshot
 For a brand-new source, the owner calls:
 
 ```go
-snapshot, err := reader.Bootstrap(ctx, projection, scope)
+snapshot, err := reader.Bootstrap(ctx, projection, scope, installRows)
 ```
 
 `Bootstrap` is the only slot-creation path. It does the following, in this order:
 
 1. Validates the projection and scope. It checks identifiers, connects to the source, verifies the publication/table relationship, and verifies that the configured scope column and primary key exist.
-2. Opens a replication connection and creates a persistent `pgoutput` logical slot. Slot creation exports no snapshot of its own; the read below takes one on a separate connection instead.
-3. On a normal SQL connection, takes the same gap-free scoped read `Snapshot` uses for every later scope (see below): begins a repeatable-read read-only transaction, exports that transaction's own snapshot, records `pg_current_wal_lsn()` as `P`, and runs the scoped `SELECT` against it.
-4. Builds `Snapshot{Rows, Cursor: P}` from that consistent SQL result.
+2. Opens a replication connection and creates a persistent `pgoutput` logical slot with `EXPORT_SNAPSHOT`. PostgreSQL returns the slot's consistent point `P` and the name of a snapshot that matches it exactly.
+3. On a normal SQL connection, begins a repeatable-read read-only transaction, adopts that exported snapshot with `SET TRANSACTION SNAPSHOT`, records it with `pg_current_snapshot()`, and streams the scoped `SELECT` to the row sink.
+4. Builds `Snapshot{Cursor: P}` with that visibility.
 5. Before returning, starts logical replication at exactly `P` on the original replication connection. The returned `Reader` now owns an already-started stream.
+
+Because the exported snapshot and `P` describe the same instant, the stream from `P` contains exactly the transactions the rows do not: no gap and no overlap. `Covers` is true for none of them.
 
 The important ordering is that the stream starts before `Bootstrap` returns. There is no later period in which the caller has a snapshot but has not yet caused the reader to begin at its paired cursor.
 
@@ -216,10 +230,18 @@ By itself, a created slot is only a bookmark. It does not provide the matching t
 `Snapshot` is the operation for that case:
 
 ```go
-snapshot, err := reader.Snapshot(ctx, projection, scope)
+snapshot, err := reader.Snapshot(ctx, projection, scope, installRows)
 ```
 
-It assumes the slot already exists — it returns `ErrSlotNotFound` if `Bootstrap` has not run yet — and otherwise does not touch the slot at all: it takes the same gap-free scoped read described above (export a fresh snapshot, record `pg_current_wal_lsn()`, run the scoped `SELECT`) on its own connection. The result pairs the scope's rows with a cursor exactly the way `Bootstrap` pairs its rows with `P`, but without creating anything.
+It assumes the slot already exists — it returns `ErrSlotNotFound` if `Bootstrap` has not run yet — and otherwise does not touch the slot at all. It has no exported slot snapshot to adopt, so it establishes its boundary itself, on its own connection:
+
+1. Reads the WAL insert position, `pg_current_wal_insert_lsn()`, as the cursor `L`. This happens *before* the snapshot is fixed, so every transaction the snapshot cannot see commits after `L`.
+2. Begins a repeatable-read read-only transaction whose first statement, `pg_current_snapshot()`, fixes and records its MVCC snapshot.
+3. Streams the scoped `SELECT` to the row sink.
+
+The consumer then installs the rows and applies every streamed transaction for which `snapshot.Covers(transaction)` is false, in stream order, skipping the ones it covers. Transactions that committed between reading `L` and fixing the snapshot are both after `L` and in the rows; `Covers` is what keeps them from being applied twice. Resuming from `L` alone can therefore replay extra transactions, but never skip one.
+
+There is one rare case a cursor cannot express. PostgreSQL writes a transaction's commit record before the transaction becomes visible to new snapshots, and with synchronous replication it can stay invisible for as long as it waits on the standby. Such a transaction can commit *before* `L` and still be missing from the rows. A consumer that has been streaming since before the snapshot - like one serving many scopes from one stream - must therefore check the transactions it already holds with `Covers`, not only the ones that arrive after `L`.
 
 Because `Snapshot` never claims the slot's replication connection, any number of scopes can call it at once, and it works whether or not `Run` is currently streaming from the slot.
 
@@ -248,6 +270,8 @@ Those are not optional details for a full production service. They are deliberat
 ## Testing the boundary
 
 The integration tests use a real PostgreSQL instance and arrange source writes before, during, and after bootstrap. They verify that rows visible in the exported snapshot appear in the returned snapshot, while later committed writes appear in the stream, with no gap or duplication caused by the boundary itself.
+
+`snapshot_boundary_integration_test.go` pins the boundary precisely: it commits a write at an exact moment relative to the snapshot (right after the MVCC snapshot is fixed, and just before the rows are read), then rebuilds the projection from the rows plus only the transactions `Covers` rejects, and requires the result to equal PostgreSQL.
 
 They also exercise invalid scopes, failed snapshot queries, publication/permission failures, missing slots, cancellation, and cleanup. Run them with:
 
