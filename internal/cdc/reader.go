@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -78,7 +79,26 @@ const (
 	defaultMaxAttempts       = 8
 	defaultJitter            = 0.20
 	defaultSnapshotBatchRows = 1000
+	// defaultMaxRetainedWALBytes is the default cap on watchd's own retention
+	// policy. It exists so that leaving MaxRetainedWALBytes unset never means
+	// "unbounded" - see issue #22's requirement for no unsafe production
+	// default.
+	defaultMaxRetainedWALBytes = 1 << 30 // 1 GiB
+	// defaultRetentionCheckInterval bounds how often Run re-reads the
+	// server's max_slot_wal_keep_size, so a live Postgres config reload is
+	// noticed without waiting for the next Bootstrap.
+	defaultRetentionCheckInterval = 5 * time.Minute
 )
+
+// walKeepSizeUnitMultipliers converts pg_settings.unit for
+// max_slot_wal_keep_size (and similarly-unitted GUCs) to bytes.
+var walKeepSizeUnitMultipliers = map[string]int64{
+	"B":  1,
+	"kB": 1024,
+	"MB": 1024 * 1024,
+	"GB": 1024 * 1024 * 1024,
+	"TB": 1024 * 1024 * 1024 * 1024,
+}
 
 var postgresIdentifier = regexp.MustCompile(`^[a-z_][a-z0-9_$]{0,62}$`)
 
@@ -123,6 +143,16 @@ type ReaderConfig struct {
 	ShutdownTimeout time.Duration
 	// RetryPolicy controls bounded reconnect behavior after transient failures.
 	RetryPolicy RetryPolicy
+
+	// MaxRetainedWALBytes bounds how much WAL watchd's own policy allows to
+	// accumulate for its replication slot. It exists independently of the
+	// PostgreSQL server's max_slot_wal_keep_size and is the only backstop
+	// when that server setting is unbounded (-1, the PostgreSQL default).
+	MaxRetainedWALBytes int64
+	// RetentionCheckInterval controls how often Bootstrap's max_slot_wal_keep_size
+	// check is repeated during Run, so a live server-side config reload is
+	// noticed without a new Bootstrap.
+	RetentionCheckInterval time.Duration
 
 	// Logger is optional. It never receives DatabaseURL, credentials, row
 	// values, tenant identifiers, or other projection data.
@@ -315,6 +345,10 @@ func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope
 		return Snapshot{}, err
 	}
 
+	if err := r.checkRetentionBudget(ctx, management); err != nil {
+		r.log(ctx, slog.LevelWarn, "could not check max_slot_wal_keep_size during bootstrap", "error", err)
+	}
+
 	if err := r.createBootstrapSlot(ctx, stream, management); err != nil {
 		return Snapshot{}, err
 	}
@@ -358,6 +392,10 @@ func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope
 // occurs, or the reconnect budget is exhausted. Context cancellation is a
 // clean shutdown and returns nil.
 func (r *Reader) Run(ctx context.Context) error {
+	monitorCtx, cancelMonitor := context.WithCancel(ctx)
+	defer cancelMonitor()
+	go r.monitorRetentionBudget(monitorCtx)
+
 	for attempts := 0; ; {
 		r.setConnectionState("connecting")
 		err := r.read(ctx)
@@ -392,6 +430,64 @@ func (r *Reader) Run(ctx context.Context) error {
 			return err
 		}
 	}
+}
+
+// monitorRetentionBudget periodically re-reads the server's
+// max_slot_wal_keep_size for as long as Run is active, so a live Postgres
+// config reload (ALTER SYSTEM + pg_reload_conf) is noticed without waiting
+// for the next Bootstrap. It runs independently of the replication
+// connection's own reconnect cycle, using short-lived management
+// connections, and never fails Run - errors are logged and skipped.
+func (r *Reader) monitorRetentionBudget(ctx context.Context) {
+	ticker := time.NewTicker(r.config.RetentionCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			management, err := r.connectManagementWithTimeout(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				r.log(ctx, slog.LevelWarn, "skipping periodic max_slot_wal_keep_size check: could not connect", "error", err)
+				continue
+			}
+			if err := r.checkRetentionBudget(ctx, management); err != nil {
+				r.log(ctx, slog.LevelWarn, "skipping periodic max_slot_wal_keep_size check", "error", err)
+			}
+			r.closeManagementConnection(management)
+		}
+	}
+}
+
+// checkRetentionBudget reads the server's max_slot_wal_keep_size and warns
+// when it leaves watchd's own configured retention budget as the sole
+// backstop against unbounded WAL growth (server value is -1), or when the
+// server is stricter than watchd's own budget and would invalidate the slot
+// before watchd's own policy would act on it.
+func (r *Reader) checkRetentionBudget(ctx context.Context, management *pgx.Conn) error {
+	serverBytes, unbounded, err := readMaxSlotWALKeepSize(ctx, management)
+	if err != nil {
+		return err
+	}
+
+	if unbounded {
+		r.log(ctx, slog.LevelWarn,
+			"PostgreSQL max_slot_wal_keep_size is unbounded (-1): source provides no WAL retention backstop; relying entirely on watchd's configured retention budget",
+			"slot", r.config.SlotName, "configured_budget_bytes", r.config.MaxRetainedWALBytes)
+		return nil
+	}
+
+	effective := effectiveRetentionBudget(r.config.MaxRetainedWALBytes, serverBytes, unbounded)
+	if effective < r.config.MaxRetainedWALBytes {
+		r.log(ctx, slog.LevelWarn,
+			"PostgreSQL max_slot_wal_keep_size is stricter than watchd's configured retention budget; effective budget clamped to the server limit",
+			"slot", r.config.SlotName, "configured_budget_bytes", r.config.MaxRetainedWALBytes, "server_max_slot_wal_keep_size_bytes", serverBytes)
+	}
+	return nil
 }
 
 // read owns exactly one PostgreSQL replication connection. A retryable return
@@ -973,6 +1069,45 @@ func lookupSlot(ctx context.Context, conn *pgx.Conn, slotName string) (slotState
 	return slot, true, nil
 }
 
+// readMaxSlotWALKeepSize reads the server's max_slot_wal_keep_size GUC in
+// bytes. It reads pg_settings' raw setting/unit columns rather than SHOW's
+// pretty-printed string, since the unit varies by server and -1 is the
+// sentinel for unbounded retention regardless of unit.
+func readMaxSlotWALKeepSize(ctx context.Context, conn *pgx.Conn) (bytes int64, unbounded bool, err error) {
+	var setting, unit string
+	err = conn.QueryRow(ctx, `
+		SELECT setting, unit
+		FROM pg_settings
+		WHERE name = 'max_slot_wal_keep_size'`).Scan(&setting, &unit)
+	if err != nil {
+		return 0, false, classifyPostgresError(err)
+	}
+
+	value, parseErr := strconv.ParseInt(setting, 10, 64)
+	if parseErr != nil {
+		return 0, false, fmt.Errorf("%w: unexpected max_slot_wal_keep_size setting %q", ErrPostgresServer, setting)
+	}
+	if value < 0 {
+		return 0, true, nil
+	}
+
+	multiplier, ok := walKeepSizeUnitMultipliers[unit]
+	if !ok {
+		return 0, false, fmt.Errorf("%w: unexpected max_slot_wal_keep_size unit %q", ErrPostgresServer, unit)
+	}
+	return value * multiplier, false, nil
+}
+
+// effectiveRetentionBudget picks the stricter of watchd's own configured
+// retention budget and the server's max_slot_wal_keep_size. When the server
+// is unbounded, watchd's own budget is the only backstop.
+func effectiveRetentionBudget(configuredBytes, serverBytes int64, serverUnbounded bool) int64 {
+	if serverUnbounded || serverBytes >= configuredBytes {
+		return configuredBytes
+	}
+	return serverBytes
+}
+
 func validateSlot(slot slotState) error {
 	if slot.slotType != "logical" || slot.plugin != "pgoutput" || slot.resumeLSN == "" {
 		return ErrSlotInvalidated
@@ -1084,6 +1219,12 @@ func normalizeReaderConfig(config ReaderConfig) ReaderConfig {
 	if config.ShutdownTimeout == 0 {
 		config.ShutdownTimeout = defaultShutdownTimeout
 	}
+	if config.MaxRetainedWALBytes == 0 {
+		config.MaxRetainedWALBytes = defaultMaxRetainedWALBytes
+	}
+	if config.RetentionCheckInterval == 0 {
+		config.RetentionCheckInterval = defaultRetentionCheckInterval
+	}
 	if config.RetryPolicy.InitialBackoff == 0 {
 		config.RetryPolicy.InitialBackoff = defaultInitialBackoff
 	}
@@ -1107,6 +1248,9 @@ func validateReaderConfig(config ReaderConfig, sink TransactionSink) error {
 		return fmt.Errorf("%w: slot and publication names must be unquoted PostgreSQL identifiers", ErrInvalidReaderConfig)
 	}
 	if config.MaxTransactionBytes <= 0 || config.MaxTransactionChanges <= 0 || config.MaxValueBytes <= 0 || config.SnapshotBatchRows <= 0 || config.ConnectionTimeout <= 0 || config.StatusInterval <= 0 || config.ShutdownTimeout <= 0 {
+		return ErrInvalidReaderConfig
+	}
+	if config.MaxRetainedWALBytes <= 0 || config.RetentionCheckInterval <= 0 {
 		return ErrInvalidReaderConfig
 	}
 	if config.MaxValueBytes > config.MaxTransactionBytes {
