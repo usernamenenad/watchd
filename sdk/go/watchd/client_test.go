@@ -91,24 +91,26 @@ type syncRun struct {
 	cancel context.CancelFunc
 }
 
-func startSync(t *testing.T, client *Client, store Store) *syncRun {
+func startSync(t *testing.T, client *Client, store Store, configure ...func(*SyncConfig)) *syncRun {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	run := &syncRun{done: make(chan error, 1), cancel: cancel}
-	go func() {
-		run.done <- client.Sync(ctx, SyncConfig{
-			Projection: "permissions",
-			Scope:      "tenant-a",
-			Store:      store,
-			MinBackoff: time.Millisecond,
-			MaxBackoff: 5 * time.Millisecond,
-			OnState: func(state State) {
-				run.mu.Lock()
-				defer run.mu.Unlock()
-				run.states = append(run.states, state)
-			},
-		})
-	}()
+	cfg := SyncConfig{
+		Projection: "permissions",
+		Scope:      "tenant-a",
+		Store:      store,
+		MinBackoff: time.Millisecond,
+		MaxBackoff: 5 * time.Millisecond,
+		OnState: func(state State) {
+			run.mu.Lock()
+			defer run.mu.Unlock()
+			run.states = append(run.states, state)
+		},
+	}
+	for _, apply := range configure {
+		apply(&cfg)
+	}
+	go func() { run.done <- client.Sync(ctx, cfg) }()
 	t.Cleanup(func() {
 		cancel()
 		select {

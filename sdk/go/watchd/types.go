@@ -8,6 +8,8 @@
 // complete (a Progress event) and the connection is up.
 package watchd
 
+import "time"
+
 // Value is one column value. Exactly one of these holds:
 //
 //   - Null is true: SQL NULL.
@@ -65,8 +67,12 @@ type Change struct {
 type Batch struct {
 	// Cursor is the position just after the transaction; persist it with
 	// the batch.
-	Cursor  string
-	Changes []Change
+	Cursor string
+	// CommitTime is when the transaction committed, by the source's clock,
+	// or zero when the server did not say. It is for measuring latency
+	// only: order comes from Cursor, freshness from State.
+	CommitTime time.Time
+	Changes    []Change
 }
 
 // State is the synchronization state of a projection.

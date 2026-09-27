@@ -55,6 +55,9 @@ Observability and performance:
 - #56 — Telemetry: instrument the ingest-to-serve hot path
 - #5 — Operations: health model, runbook, and alerts, built on #55 and #56
 - #57 — Performance: benchmarks, load harness, and first baselines
+- #68 — Performance: index hub fan-out by scope instead of scanning every watcher
+- #69 — Performance: cut per-change allocations in pgoutput decoding
+- #70 — Performance: encode each batch once per scope, not once per watcher
 
 Deployment and release:
 
@@ -111,6 +114,7 @@ Second batch, split from closed issues or added for observability and deployment
 - #60 — **Deploy: Helm chart for Kubernetes.** Single replica with `Recreate`, gRPC probes, secret references, the restricted security context, NetworkPolicy, and ServiceMonitor.
 - #61 — **Tests: Kubernetes end-to-end on kind.** Install the chart, sync a consumer in the cluster, and resync correctly across a pod restart.
 - #64 — **CDC: enforce the retained-WAL budget with a staged response.** The rest of #22: warn, degrade, and terminal stages on top of the retained-WAL measurement from #56, plus orphan-slot cleanup.
+- #68, #69, #70 — **Performance: the first hot paths.** Found by #56's instrumentation: hub fan-out linear in watchers, per-change decode allocations, and per-watcher protobuf encoding. Each is measured before and after with its benchmark.
 
 ## Order
 
@@ -126,7 +130,7 @@ These dependencies constrain the sequence:
 | --- | --- |
 | A — Foundations | Done: #9, #22, #29, #30, #31, #32, #3, #4, #21 |
 | B — Correctness and safety | #7, #20, #33, #53, #54, #6 → #52, #56 → #64 |
-| C — Observability | #55 → #56 → #57, #5 |
+| C — Observability | #55 → #56 → #57, #5, #68, #69, #70 |
 | D — Deployment | #58 → #59, #60 → #61 |
 | E — Ship | #34, #37, #36, #25 → #8 → tag |
 
