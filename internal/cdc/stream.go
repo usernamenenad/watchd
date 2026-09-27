@@ -15,17 +15,24 @@ import (
 // Run streams transactions until ctx is cancelled, a non-retryable error
 // occurs, or the reconnect budget is exhausted. Context cancellation is a
 // clean shutdown and returns nil.
+//
+// While it runs, the retention policy watches the slot's retained WAL. If
+// it reaches the effective retention budget, Run stops streaming, drops the
+// slot to protect the source, and returns ErrRetainedWALBudgetExceeded.
 func (r *Reader) Run(ctx context.Context) error {
-	monitorCtx, cancelMonitor := context.WithCancel(ctx)
-	defer cancelMonitor()
-	go r.monitorRetentionBudget(monitorCtx)
+	streamCtx, stopStream := context.WithCancelCause(ctx)
+	defer stopStream(nil)
+	go r.monitorRetentionBudget(streamCtx, stopStream)
 
 	for attempts := 0; ; {
 		r.setConnectionState(stateConnecting)
-		err := r.read(ctx)
+		err := r.read(streamCtx)
 		if ctx.Err() != nil {
 			r.setConnectionState(stateStopped)
 			return nil
+		}
+		if streamCtx.Err() != nil {
+			return r.budgetExceeded(ctx, streamCtx)
 		}
 		if err == nil {
 			r.setConnectionState(stateStopped)
@@ -46,15 +53,32 @@ func (r *Reader) Run(ctx context.Context) error {
 		delay := r.retryDelay(attempts)
 		r.log(ctx, slog.LevelWarn, "PostgreSQL logical replication connection lost; retrying", "attempt", attempts, "delay", delay, "error", err)
 		r.setConnectionState(stateBackingOff)
-		if err := r.wait(ctx, delay); err != nil {
+		if err := r.wait(streamCtx, delay); err != nil {
 			if ctx.Err() != nil {
 				r.setConnectionState(stateStopped)
 				return nil
+			}
+			if streamCtx.Err() != nil {
+				return r.budgetExceeded(ctx, streamCtx)
 			}
 			r.setConnectionState(stateFailed)
 			return err
 		}
 	}
+}
+
+// budgetExceeded is the retention policy's terminal action, once read has
+// closed the replication connection: drop the slot, and fail Run.
+func (r *Reader) budgetExceeded(ctx, streamCtx context.Context) error {
+	r.setConnectionState(stateFailed)
+	cause := context.Cause(streamCtx)
+	r.metrics.streamError(ctx, cause)
+	if err := r.dropSlotForBudget(ctx); err != nil {
+		r.log(ctx, slog.LevelError, "could not drop the replication slot after the retention budget was reached", "slot", r.config.SlotName, "error", err)
+		return fmt.Errorf("%w; dropping slot %s failed, so PostgreSQL still retains its WAL: %v", cause, r.config.SlotName, err)
+	}
+	r.log(ctx, slog.LevelError, "dropped the replication slot: the retention budget was reached", "slot", r.config.SlotName)
+	return fmt.Errorf("%w: dropped replication slot %s", cause, r.config.SlotName)
 }
 
 // read owns exactly one PostgreSQL replication connection. A retryable return
@@ -271,8 +295,16 @@ func (r *Reader) consumeCopyData(
 
 		r.observeServerWALEnd(keepalive.ServerWALEnd)
 
-		// Keepalives carry no source mutation. Reply with safeLSN only when the
-		// server asks; never advance it to keepalive.ServerWALEnd.
+		// A logical walsender's keepalive carries its sent position: every
+		// transaction committing before it has already been streamed - or
+		// skipped, for tables outside the publication. Between transactions
+		// the sink has accepted all of them, so safeLSN may advance to it.
+		// Without this, a slot whose published tables are idle while others
+		// are busy would retain WAL forever. Inside a transaction it must not
+		// move: that transaction is not accepted yet.
+		if !decoder.InTransaction() && keepalive.ServerWALEnd > *safeLSN {
+			*safeLSN = keepalive.ServerWALEnd
+		}
 		if keepalive.ReplyRequested {
 			if err := r.acknowledge(ctx, conn, *safeLSN); err != nil {
 				return classifyPostgresError(err)

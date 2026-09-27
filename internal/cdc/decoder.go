@@ -177,6 +177,12 @@ func (d *Decoder) append(change Change) error {
 	return nil
 }
 
+// InTransaction reports whether a BEGIN has arrived without its COMMIT. It
+// must be called from the reader's single goroutine.
+func (d *Decoder) InTransaction() bool {
+	return d.pending != nil
+}
+
 // Pending returns the current transaction's bounded in-memory footprint. It
 // is intended for reader diagnostics and must be called from the reader's
 // single goroutine.

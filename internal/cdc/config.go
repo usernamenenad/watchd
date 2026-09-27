@@ -77,8 +77,16 @@ type ReaderConfig struct {
 	// noticed without a new Bootstrap.
 	RetentionCheckInterval time.Duration
 	// RetentionSampleInterval controls how often Run reads the slot's retained
-	// WAL from pg_replication_slots for the retention metrics.
+	// WAL from pg_replication_slots, for the retention policy and metrics.
 	RetentionSampleInterval time.Duration
+	// RetentionWarnFraction and RetentionDegradeFraction are the retention
+	// policy's thresholds, as fractions of the effective retention budget
+	// (the stricter of MaxRetainedWALBytes and max_slot_wal_keep_size). They
+	// default to 0.5 and 0.8, and must satisfy 0 < warn < degrade < 1. At
+	// the budget itself, Run drops the slot and returns
+	// ErrRetainedWALBudgetExceeded.
+	RetentionWarnFraction    float64
+	RetentionDegradeFraction float64
 
 	// Meter is optional. The reader's instruments are created from it once,
 	// in NewReader; nil records nothing. See docs/observability.md.
@@ -120,6 +128,12 @@ func normalizeReaderConfig(config ReaderConfig) ReaderConfig {
 	if config.RetentionSampleInterval == 0 {
 		config.RetentionSampleInterval = defaultRetentionSampleInterval
 	}
+	if config.RetentionWarnFraction == 0 {
+		config.RetentionWarnFraction = defaultRetentionWarnFraction
+	}
+	if config.RetentionDegradeFraction == 0 {
+		config.RetentionDegradeFraction = defaultRetentionDegradeFraction
+	}
 	if config.RetryPolicy.InitialBackoff == 0 {
 		config.RetryPolicy.InitialBackoff = defaultInitialBackoff
 	}
@@ -147,6 +161,9 @@ func validateReaderConfig(config ReaderConfig, sink TransactionSink) error {
 	}
 	if config.MaxRetainedWALBytes <= 0 || config.RetentionCheckInterval <= 0 || config.RetentionSampleInterval <= 0 {
 		return ErrInvalidReaderConfig
+	}
+	if !(0 < config.RetentionWarnFraction && config.RetentionWarnFraction < config.RetentionDegradeFraction && config.RetentionDegradeFraction < 1) {
+		return fmt.Errorf("%w: retention thresholds must satisfy 0 < warn < degrade < 1", ErrInvalidReaderConfig)
 	}
 	if config.MaxValueBytes > config.MaxTransactionBytes {
 		return fmt.Errorf("%w: MaxValueBytes must not exceed MaxTransactionBytes", ErrInvalidReaderConfig)

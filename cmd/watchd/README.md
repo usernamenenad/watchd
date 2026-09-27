@@ -65,6 +65,9 @@ The same configuration in JSON:
 | `ops.listen_address` | Where the ops HTTP endpoint listens: `/metrics`, `/healthz`, `/readyz`. Omit it to disable the endpoint. |
 | `ops.pprof` | Serve `/debug/pprof/*` on the ops endpoint. Default `false`: profiles reveal internals. |
 | `ops.mutex_profile_fraction`, `ops.block_profile_rate` | Sampling rates for the mutex and block profiles (see `runtime.SetMutexProfileFraction` and `runtime.SetBlockProfileRate`). Default `0`, which leaves those profiles empty. They require `ops.pprof`. |
+| `retention.max_retained_wal_bytes` | The most WAL PostgreSQL may retain for the slot before watchd drops it. Default 1 GiB. The server's `max_slot_wal_keep_size` applies too, if it is stricter. |
+| `retention.warn_fraction`, `retention.degrade_fraction` | Fractions of that budget where watchd logs a warning, then an error. Default `0.5` and `0.8`. |
+| `retention.sample_interval` | How often retained WAL is checked. Default `30s`. |
 | `projections` | The projections clients may watch, by name. `scope_column` must be one of `primary_key`. |
 
 The database URL comes only from `WATCHD_DATABASE_URL`, so the file never
@@ -92,6 +95,12 @@ configured by the standard `OTEL_EXPORTER_OTLP_*` variables.
   Pending OTLP metrics are pushed within the same timeout.
 - **Source failure** (for example an invalidated slot): the process shuts
   down the same way and exits with code 3.
+- **Retention budget reached**: retained WAL grew to
+  `retention.max_retained_wal_bytes`, because something held acknowledgement
+  back. watchd drops its slot to protect PostgreSQL's disk, tells every
+  client to resync, and exits with code 3. The next start builds a new slot,
+  and every client rebuilds. See
+  [the retention policy](../../docs/cdc-lifecycle.md#retention-policy).
 
 | Exit code | Meaning |
 | --- | --- |

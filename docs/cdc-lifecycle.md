@@ -211,9 +211,25 @@ After a reconnect, PostgreSQL may resend a batch that reached the sink but was n
 | Graceful shutdown | Stops `Run`; the persistent slot remains, so a future runtime can resume it. | The slot and durable local state. |
 | Slot is missing or invalidated | Returns `ErrSlotInvalidated`; it never silently creates a replacement slot. | An explicit resync/source-replacement workflow. |
 | Bootstrap fails before it returns | Cleans up its temporary SQL transaction/connection and drops the slot it created when possible. | Nothing should be installed locally. |
-| Hard process crash during bootstrap | PostgreSQL can retain an orphan persistent slot. | A future control-plane cleanup/recovery policy. |
+| Hard process crash during bootstrap | The slot survives. On the next start, `Source.Start` finds it and resumes it with `Run`. Every consumer takes a fresh snapshot after a restart anyway, so adopting it is safe, and from then on the retention policy governs it. | watchd restarting with the same `slot_name`. A slot that no watchd will ever run against again is outside watchd's reach: PostgreSQL's `max_slot_wal_keep_size` is the only backstop. |
+| Retained WAL reaches the retention budget | Stops streaming, drops the slot, and returns `ErrRetainedWALBudgetExceeded`. See [Retention policy](#retention-policy). | Every consumer rebuilds from a snapshot on the new slot the next start creates. |
 
 The difference between a normal reconnect and a missing slot is deliberate. A reconnect resumes the same history. A newly created slot begins a different history and cannot prove that it matches the local projection, so it must be an explicit rebuild operation.
+
+## Retention policy
+
+PostgreSQL keeps every WAL segment the slot has not confirmed. Anything that stops acknowledgement retains WAL on a server watchd does not own: a watchd outage, a sink that never accepts, a bug. So the reader bounds it. While `Run` streams, it samples `pg_replication_slots` every `RetentionSampleInterval` (30s) and compares retained WAL (the current WAL position minus the slot's `restart_lsn`) with the effective budget: the stricter of `MaxRetainedWALBytes` (1 GiB) and the server's `max_slot_wal_keep_size`.
+
+| State | Entered at | What happens | Operator action |
+| --- | --- | --- | --- |
+| `ok` | below warn | Nothing. | None. |
+| `warn` | `RetentionWarnFraction` (0.5) of the budget | A warning log. | Find what holds acknowledgement back: `watchd.cdc.ack_lag`, `watchd.cdc.sink.duration`, `watchd.cdc.stream.state`. |
+| `degrade` | `RetentionDegradeFraction` (0.8) | An error log: the terminal action is close. | Act now: fix the cause, or accept the rebuild. Raising the budget only buys time. |
+| `terminal` | the budget | Streaming stops, the slot is dropped, and `Run` returns `ErrRetainedWALBudgetExceeded`. The daemon ends every watch with `Resync` and exits with code 3. | Fix the cause and restart. The next start builds a new slot, and every consumer rebuilds from a snapshot. |
+
+A state is left only once retained WAL falls 5% of the budget below its threshold, so a slot hovering at a threshold does not flap. `terminal` is final. States and transitions are exported as `watchd.cdc.retention.state` and `watchd.cdc.retention.transitions`, and `ReaderStats.RetentionState` reports the current one. The slot is sampled as soon as `Run` starts, so a slot that grew past its budget while watchd was down is caught at once.
+
+Between transactions, the reader acknowledges the position in each PostgreSQL keepalive, not only the end of the last accepted transaction. A logical walsender's keepalive carries its sent position: every transaction committing before it was already streamed, or skipped because it touched no published table. Without this, a slot whose published tables are idle while other tables are busy would retain WAL forever, and the policy would drop a healthy slot. Inside a transaction the keepalive position is never acknowledged, because that transaction is not accepted yet.
 
 ## Why there is no `InitializeSlot`
 
@@ -275,8 +291,8 @@ It is not yet the entire production watchd product. The higher-level runtime/con
 - a watch API and SDK that let applications register/query projections;
 - routing each scope's committed changes from the one shared stream to the right local projection, applying `Snapshot.Covers` to transactions already streamed, and retrying `Snapshot` when `ErrSnapshotWindowClosed` occurs;
 - leader election or ownership so two replicas do not consume the same slot unintentionally;
-- explicit resync, source replacement, and orphan-slot cleanup after a hard crash;
-- operational monitoring for slot lag, retained WAL, failed sinks, and bootstrap progress;
+- explicit source replacement, and cleanup of a slot no watchd will run against again (only `max_slot_wal_keep_size` bounds that one; see [Retention policy](#retention-policy));
+- alerting and dashboards on the exported metrics ([docs/observability.md](observability.md)), including slot lag and retained WAL;
 - authorization and tenancy boundaries around sources, publications, and scopes.
 
 Those are not optional details for a full production service. They are deliberately separate from the narrow job of making a source snapshot and WAL stream agree on one cursor.

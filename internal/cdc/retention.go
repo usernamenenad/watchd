@@ -36,19 +36,27 @@ var walKeepSizeUnitMultipliers = map[string]int64{
 	"TB": 1024 * 1024 * 1024 * 1024,
 }
 
-// monitorRetentionBudget runs for as long as Run is active. Every
-// RetentionCheckInterval it re-reads the server's max_slot_wal_keep_size, so
-// a live Postgres config reload (ALTER SYSTEM + pg_reload_conf) is noticed
-// without waiting for the next Bootstrap. Every RetentionSampleInterval it
-// samples the slot's retained WAL for the retention metrics. It runs
-// independently of the replication connection's own reconnect cycle, using
-// short-lived management connections, and never fails Run - errors are
+// monitorRetentionBudget runs for as long as Run is active. It samples the
+// slot's retained WAL at once and then every RetentionSampleInterval, for
+// the retention policy and metrics; when the policy reaches its terminal
+// state it calls stopStream. Every RetentionCheckInterval it also re-reads
+// the server's max_slot_wal_keep_size, so a live Postgres config reload
+// (ALTER SYSTEM + pg_reload_conf) is noticed without waiting for the next
+// Bootstrap. It uses short-lived management connections, independent of the
+// replication connection's reconnect cycle; a failed sample or check is
 // logged and skipped.
-func (r *Reader) monitorRetentionBudget(ctx context.Context) {
+func (r *Reader) monitorRetentionBudget(ctx context.Context, stopStream context.CancelCauseFunc) {
 	check := time.NewTicker(r.config.RetentionCheckInterval)
 	defer check.Stop()
 	sample := time.NewTicker(r.config.RetentionSampleInterval)
 	defer sample.Stop()
+	sampleRetention := func(ctx context.Context, management *pgx.Conn) error {
+		return r.sampleRetention(ctx, management, stopStream)
+	}
+	// Sample at once: a slot that grew while watchd was down may already be
+	// past its budget.
+	now := make(chan time.Time, 1)
+	now <- time.Now()
 
 	for {
 		var (
@@ -60,8 +68,10 @@ func (r *Reader) monitorRetentionBudget(ctx context.Context) {
 			return
 		case <-check.C:
 			task, name = r.checkRetentionBudget, "max_slot_wal_keep_size check"
+		case <-now:
+			task, name = sampleRetention, "retained WAL sample"
 		case <-sample.C:
-			task, name = r.sampleRetention, "retained WAL sample"
+			task, name = sampleRetention, "retained WAL sample"
 		}
 		management, err := r.connectManagementWithTimeout(ctx)
 		if err != nil {
@@ -80,9 +90,8 @@ func (r *Reader) monitorRetentionBudget(ctx context.Context) {
 
 // sampleRetention reads how much WAL PostgreSQL retains for the slot, how
 // much more it may write before invalidating the slot, and the effective
-// retention budget, for the retention metrics. Enforcing the budget is
-// #64's; this only measures.
-func (r *Reader) sampleRetention(ctx context.Context, management *pgx.Conn) error {
+// retention budget, records them, and applies the retention policy to them.
+func (r *Reader) sampleRetention(ctx context.Context, management *pgx.Conn, stopStream context.CancelCauseFunc) error {
 	var (
 		retained, safe *int64
 		status         string
@@ -114,8 +123,14 @@ func (r *Reader) sampleRetention(ctx context.Context, management *pgx.Conn) erro
 			metrics.walStatus.Store(int32(i))
 		}
 	}
-	metrics.effectiveBudget.Store(effectiveRetentionBudget(r.config.MaxRetainedWALBytes, serverBytes, unbounded))
+	budget := effectiveRetentionBudget(r.config.MaxRetainedWALBytes, serverBytes, unbounded)
+	metrics.effectiveBudget.Store(budget)
 	metrics.retentionKnown.Store(true)
+	// With no restart_lsn the slot is already invalidated; the stream
+	// reports that itself, as ErrSlotInvalidated.
+	if retained != nil {
+		r.applyRetentionPolicy(ctx, *retained, budget, stopStream)
+	}
 	return nil
 }
 
