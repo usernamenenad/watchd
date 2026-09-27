@@ -79,7 +79,7 @@ func TestReaderEmitsAtomicTransactionAndAcknowledges(t *testing.T) {
 			t.Fatalf("change %d operation = %q, want insert", index, change.Operation)
 		}
 	}
-	if transaction.Cursor == "" {
+	if transaction.Cursor.IsZero() {
 		t.Fatal("transaction cursor is empty")
 	}
 
@@ -87,6 +87,27 @@ func TestReaderEmitsAtomicTransactionAndAcknowledges(t *testing.T) {
 	stats := reader.Stats()
 	if stats.TransactionsAccepted != 1 || stats.LastAcknowledgedLSN == "" {
 		t.Fatalf("reader stats = %#v, want one acknowledged transaction", stats)
+	}
+	// A transaction's cursor is the position the reader acknowledges for it,
+	// so a consumer that persisted it resumes exactly after this transaction.
+	if got := transaction.Cursor.String(); got != stats.LastAcknowledgedLSN {
+		t.Fatalf("transaction cursor = %s, want acknowledged position %s", got, stats.LastAcknowledgedLSN)
+	}
+	// The reader stamps its source ID, so the cursor compares only with
+	// cursors of the same source.
+	sameSource, err := cdc.ParseCursor("test-postgres", stats.LastAcknowledgedLSN)
+	if err != nil {
+		t.Fatalf("parse acknowledged cursor: %v", err)
+	}
+	if order, err := transaction.Cursor.Compare(sameSource); err != nil || order != 0 {
+		t.Fatalf("compare with same-source cursor = %d, %v; want 0, nil", order, err)
+	}
+	otherSource, err := cdc.ParseCursor("other-source", stats.LastAcknowledgedLSN)
+	if err != nil {
+		t.Fatalf("parse other-source cursor: %v", err)
+	}
+	if _, err := transaction.Cursor.Compare(otherSource); err == nil {
+		t.Fatal("compare across sources: got nil error, want one")
 	}
 
 	stop()
@@ -436,6 +457,7 @@ func newIntegrationReaderWithRetry(t *testing.T, slotName string, sink cdc.Trans
 
 	reader, err := cdc.NewReader(cdc.ReaderConfig{
 		DatabaseURL:           envOrDefault("WATCHD_TEST_REPLICATION_URL", defaultReplicationURL),
+		SourceID:              "test-postgres",
 		SlotName:              slotName,
 		PublicationName:       publicationName,
 		StatusInterval:        100 * time.Millisecond,

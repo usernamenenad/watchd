@@ -47,6 +47,10 @@ type Reader struct {
 	bootstrapStream *CDC
 	bootstrapLSN    pglogrepl.LSN
 
+	// Test hooks for snapshot-boundary races. afterSnapshotFixed runs once
+	// the read's MVCC snapshot is fixed; beforeSnapshotRead runs just before
+	// the scoped rows are read.
+	afterSnapshotFixed func(context.Context) error
 	beforeSnapshotRead func(context.Context) error
 }
 

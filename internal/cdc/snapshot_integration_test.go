@@ -309,6 +309,7 @@ func TestBootstrapSnapshotDeliversRowsInPaginatedBatches(t *testing.T) {
 	slotName := fmt.Sprintf("watchd_paginated_scope_%d", time.Now().UnixNano())
 	reader, err := NewReader(ReaderConfig{
 		DatabaseURL:       testReplicationURL,
+		SourceID:          "test-postgres",
 		SlotName:          slotName,
 		PublicationName:   testPublication,
 		StatusInterval:    100 * time.Millisecond,

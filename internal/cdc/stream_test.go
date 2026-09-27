@@ -14,6 +14,7 @@ import (
 func TestReaderRetryDelayIsBoundedAndJittered(t *testing.T) {
 	reader, err := NewReader(ReaderConfig{
 		DatabaseURL:     "postgres://example.invalid/watchd",
+		SourceID:        "test-postgres",
 		SlotName:        "watchd_source",
 		PublicationName: "watchd_publication",
 		RetryPolicy: RetryPolicy{
@@ -79,6 +80,7 @@ func TestReaderRejectsMalformedAndUnknownCopyData(t *testing.T) {
 func TestReaderStopsAfterRetryBudgetExhausts(t *testing.T) {
 	reader, err := NewReader(ReaderConfig{
 		DatabaseURL:     "postgres://example.invalid/watchd",
+		SourceID:        "test-postgres",
 		SlotName:        "watchd_source",
 		PublicationName: "watchd_publication",
 		RetryPolicy: RetryPolicy{

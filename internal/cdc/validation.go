@@ -103,6 +103,25 @@ func validateProjectionSpecConfig(spec ProjectionSpec) error {
 		}
 		seen[column] = struct{}{}
 	}
+	// With the default replica identity, a DELETE carries only the primary
+	// key. The scope column must be part of it, or a delete could not be
+	// routed to the scope whose projection holds the row.
+	if _, found := seen[spec.ScopeColumn]; !found {
+		return fmt.Errorf("%w: projection scope column %q must be part of the primary key", ErrInvalidReaderConfig, spec.ScopeColumn)
+	}
+	return nil
+}
+
+// validateSourceProjectionSpec validates spec's static configuration and
+// that it belongs to this reader's source, so every cursor the reader hands
+// out for it is comparable with the stream's.
+func (r *Reader) validateSourceProjectionSpec(spec ProjectionSpec) error {
+	if err := validateProjectionSpecConfig(spec); err != nil {
+		return err
+	}
+	if spec.SourceID != r.config.SourceID {
+		return fmt.Errorf("%w: projection source %q does not match reader source %q", ErrInvalidReaderConfig, spec.SourceID, r.config.SourceID)
+	}
 	return nil
 }
 

@@ -8,8 +8,12 @@ import (
 	"github.com/jackc/pglogrepl"
 )
 
-// ErrNoCursors indicates that MinCursor was called with no cursors to compare.
-var ErrNoCursors = errors.New("cdc: no cursors to compare")
+var (
+	// ErrNoCursors indicates that MinCursor was called with no cursors to compare.
+	ErrNoCursors = errors.New("cdc: no cursors to compare")
+	// ErrInvalidCursor indicates text that is not a cursor this package produced.
+	ErrInvalidCursor = errors.New("cdc: invalid cursor")
+)
 
 const (
 	OperationInsert = "insert"
@@ -37,11 +41,32 @@ type Change struct {
 	Values    map[string]any
 }
 
-// Transaction is an atomic batch of committed source changes. Cursor is the
-// source commit position and is deliberately opaque to callers.
+// Transaction is an atomic batch of committed source changes.
+//
+// Cursor is the position just after this transaction's commit - the point a
+// consumer that has applied it resumes from, and the position the Reader
+// acknowledges to PostgreSQL once its sink accepts the transaction.
 type Transaction struct {
-	Cursor  string
+	Cursor  Cursor
 	Changes []Change
+
+	// commitLSN is the start of the transaction's commit record, which is
+	// what PostgreSQL itself compares against a replication start position.
+	commitLSN pglogrepl.LSN
+	// xid is the source transaction ID, used to decide whether a snapshot
+	// already contains this transaction's effects.
+	xid uint32
+}
+
+// After reports whether t commits at or after c, i.e. whether a consumer
+// resuming from c must still apply t. It mirrors PostgreSQL's own rule for a
+// replication start position. It returns an error if t and c belong to
+// different sources.
+func (t Transaction) After(c Cursor) (bool, error) {
+	if t.Cursor.sourceID != c.sourceID {
+		return false, fmt.Errorf("cdc: cannot compare a transaction and a cursor from different sources (%q, %q)", t.Cursor.sourceID, c.sourceID)
+	}
+	return t.commitLSN >= c.lsn, nil
 }
 
 // ProjectionSpec identifies one configured projection table. It is trusted
@@ -98,6 +123,19 @@ func (c Cursor) String() string {
 	return c.lsn.String()
 }
 
+// ParseCursor restores a cursor previously produced by Cursor.String for the
+// given source, such as a resume position a client persisted and sent back.
+func ParseCursor(sourceID, text string) (Cursor, error) {
+	if sourceID == "" {
+		return Cursor{}, fmt.Errorf("%w: cursor source ID is required", ErrInvalidCursor)
+	}
+	lsn, err := pglogrepl.ParseLSN(text)
+	if err != nil {
+		return Cursor{}, fmt.Errorf("%w: %q", ErrInvalidCursor, text)
+	}
+	return Cursor{sourceID: sourceID, lsn: lsn}, nil
+}
+
 // MinCursor returns the earliest of cursors. Given the progress cursors of
 // several scopes of one source, the result is the consistent-cut boundary:
 // a client may treat it as a snapshot-consistent state across those scopes.
@@ -124,9 +162,40 @@ func MinCursor(cursors ...Cursor) (Cursor, error) {
 // Snapshot is a consistent scoped read paired with the opaque cursor at
 // which replication must resume. Rows are delivered separately through the
 // SnapshotRowSink passed to Snapshot/Bootstrap, not carried on this struct.
+//
+// The snapshot and the change stream meet at a boundary with no gap: every
+// committed transaction is either already in the rows (Covers reports true)
+// or must be applied from the stream. See Covers for how a consumer uses it.
 type Snapshot struct {
 	SourceID string
 	Cursor   Cursor
+
+	visibility *visibility
+}
+
+// Covers reports whether transaction t's effects are already in the
+// snapshot's rows. A consumer installs the rows, then applies every streamed
+// transaction for which Covers is false, in stream order; transactions for
+// which it is true must be skipped, or the projection moves backwards.
+//
+// Every transaction Covers rejects commits after Cursor, with one exception:
+// a transaction whose commit record is written before it becomes visible to
+// new snapshots - for example while it waits on a synchronous standby - can
+// commit just before Cursor and still be missing from the rows. A consumer
+// that has already streamed past Cursor must therefore check the
+// transactions it already holds, not only the ones that arrive later.
+//
+// The decision is made by transaction ID against the read's MVCC snapshot,
+// not by comparing positions, so it is exact regardless of how a commit
+// raced the read. It returns an error if t is from a different source.
+func (s Snapshot) Covers(t Transaction) (bool, error) {
+	if t.Cursor.sourceID != s.Cursor.sourceID {
+		return false, fmt.Errorf("cdc: cannot check a transaction from source %q against a snapshot of source %q", t.Cursor.sourceID, s.Cursor.sourceID)
+	}
+	if s.visibility == nil {
+		return false, nil
+	}
+	return s.visibility.includes(t.xid), nil
 }
 
 // TransactionSink is watchd's local durability boundary. Returning nil means

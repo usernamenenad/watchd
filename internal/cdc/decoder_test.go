@@ -13,19 +13,21 @@ func TestDecoderEmitsOnlyCommittedTransaction(t *testing.T) {
 	relation := sampleRelation()
 
 	mustConsume(t, decoder, relation)
-	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{Xid: 731})
 	mustConsume(t, decoder, &pglogrepl.InsertMessage{
 		RelationID: relation.RelationID,
 		Tuple:      fullTuple("acme", "alice", "editor"),
 	})
 
-	transaction, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 42})
+	transaction, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 42, TransactionEndLSN: 90})
 	if err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
 	want := &Transaction{
-		Cursor: "0/2A",
+		Cursor:    Cursor{lsn: 90},
+		commitLSN: 42,
+		xid:       731,
 		Changes: []Change{{
 			Operation: OperationInsert,
 			Table:     "public.tenant_permissions_projection",
