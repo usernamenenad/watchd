@@ -47,7 +47,7 @@ func TestWatchdEndToEnd(t *testing.T) {
 	setPermission(t, ctx, app, tenantB, 1, "owner")
 
 	slotName := fmt.Sprintf("watchd_e2e_%d", time.Now().UnixNano())
-	cfg, err := daemon.ParseConfig(stringsReader(fmt.Sprintf(`{
+	cfg, err := daemon.ParseJSONConfig(stringsReader(fmt.Sprintf(`{
 		"source_id": "e2e",
 		"slot_name": %q,
 		"publication_name": "watchd_publication",
@@ -63,7 +63,7 @@ func TestWatchdEndToEnd(t *testing.T) {
 		}
 	}`, slotName)), envOrDefault("WATCHD_TEST_REPLICATION_URL", defaultReplicationURL))
 	if err != nil {
-		t.Fatalf("ParseConfig: %v", err)
+		t.Fatalf("ParseJSONConfig: %v", err)
 	}
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
