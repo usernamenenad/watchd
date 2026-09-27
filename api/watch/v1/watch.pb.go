@@ -15,6 +15,7 @@ import (
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
 	structpb "google.golang.org/protobuf/types/known/structpb"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -532,8 +533,13 @@ type Batch struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// cursor is the position just after the transaction. After applying the
 	// batch, the client may persist it and resume from it.
-	Cursor        string    `protobuf:"bytes,1,opt,name=cursor,proto3" json:"cursor,omitempty"`
-	Changes       []*Change `protobuf:"bytes,2,rep,name=changes,proto3" json:"changes,omitempty"`
+	Cursor  string    `protobuf:"bytes,1,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	Changes []*Change `protobuf:"bytes,2,rep,name=changes,proto3" json:"changes,omitempty"`
+	// commit_time is when the transaction committed, by the source's clock.
+	// It is informational, for measuring latency (it is subject to clock
+	// skew between the source and the client): order comes only from
+	// cursor. Unset when the server does not know it.
+	CommitTime    *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=commit_time,json=commitTime,proto3" json:"commit_time,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -578,6 +584,13 @@ func (x *Batch) GetCursor() string {
 func (x *Batch) GetChanges() []*Change {
 	if x != nil {
 		return x.Changes
+	}
+	return nil
+}
+
+func (x *Batch) GetCommitTime() *timestamppb.Timestamp {
+	if x != nil {
+		return x.CommitTime
 	}
 	return nil
 }
@@ -995,7 +1008,7 @@ var File_api_watch_v1_watch_proto protoreflect.FileDescriptor
 
 const file_api_watch_v1_watch_proto_rawDesc = "" +
 	"\n" +
-	"\x18api/watch/v1/watch.proto\x12\bwatch.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1cgoogle/protobuf/struct.proto\"i\n" +
+	"\x18api/watch/v1/watch.proto\x12\bwatch.v1\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1fgoogle/protobuf/timestamp.proto\"i\n" +
 	"\fWatchRequest\x12\x1e\n" +
 	"\n" +
 	"projection\x18\x01 \x01(\tR\n" +
@@ -1013,10 +1026,12 @@ const file_api_watch_v1_watch_proto_rawDesc = "" +
 	"\rSnapshotBegin\"1\n" +
 	"\fSnapshotRows\x12!\n" +
 	"\x04rows\x18\x01 \x03(\v2\r.watch.v1.RowR\x04rows\"\r\n" +
-	"\vSnapshotEnd\"K\n" +
+	"\vSnapshotEnd\"\x88\x01\n" +
 	"\x05Batch\x12\x16\n" +
 	"\x06cursor\x18\x01 \x01(\tR\x06cursor\x12*\n" +
-	"\achanges\x18\x02 \x03(\v2\x10.watch.v1.ChangeR\achanges\"\"\n" +
+	"\achanges\x18\x02 \x03(\v2\x10.watch.v1.ChangeR\achanges\x12;\n" +
+	"\vcommit_time\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"commitTime\"\"\n" +
 	"\bProgress\x12\x16\n" +
 	"\x06cursor\x18\x01 \x01(\tR\x06cursor\"8\n" +
 	"\x06Resync\x12.\n" +
@@ -1101,8 +1116,9 @@ var file_api_watch_v1_watch_proto_goTypes = []any{
 	nil,                            // 16: watch.v1.Row.ValuesEntry
 	nil,                            // 17: watch.v1.Change.KeyEntry
 	nil,                            // 18: watch.v1.Change.ValuesEntry
-	(structpb.NullValue)(0),        // 19: google.protobuf.NullValue
-	(*emptypb.Empty)(nil),          // 20: google.protobuf.Empty
+	(*timestamppb.Timestamp)(nil),  // 19: google.protobuf.Timestamp
+	(structpb.NullValue)(0),        // 20: google.protobuf.NullValue
+	(*emptypb.Empty)(nil),          // 21: google.protobuf.Empty
 }
 var file_api_watch_v1_watch_proto_depIdxs = []int32{
 	5,  // 0: watch.v1.WatchResponse.snapshot_begin:type_name -> watch.v1.SnapshotBegin
@@ -1113,25 +1129,26 @@ var file_api_watch_v1_watch_proto_depIdxs = []int32{
 	10, // 5: watch.v1.WatchResponse.resync:type_name -> watch.v1.Resync
 	11, // 6: watch.v1.SnapshotRows.rows:type_name -> watch.v1.Row
 	12, // 7: watch.v1.Batch.changes:type_name -> watch.v1.Change
-	0,  // 8: watch.v1.Resync.reason:type_name -> watch.v1.ResyncReason
-	16, // 9: watch.v1.Row.values:type_name -> watch.v1.Row.ValuesEntry
-	1,  // 10: watch.v1.Change.operation:type_name -> watch.v1.Operation
-	17, // 11: watch.v1.Change.key:type_name -> watch.v1.Change.KeyEntry
-	18, // 12: watch.v1.Change.values:type_name -> watch.v1.Change.ValuesEntry
-	19, // 13: watch.v1.Value.null:type_name -> google.protobuf.NullValue
-	20, // 14: watch.v1.Value.unchanged_toast:type_name -> google.protobuf.Empty
-	2,  // 15: watch.v1.CompareCursorsResponse.order:type_name -> watch.v1.CursorOrder
-	13, // 16: watch.v1.Row.ValuesEntry.value:type_name -> watch.v1.Value
-	13, // 17: watch.v1.Change.ValuesEntry.value:type_name -> watch.v1.Value
-	3,  // 18: watch.v1.WatchService.Watch:input_type -> watch.v1.WatchRequest
-	14, // 19: watch.v1.WatchService.CompareCursors:input_type -> watch.v1.CompareCursorsRequest
-	4,  // 20: watch.v1.WatchService.Watch:output_type -> watch.v1.WatchResponse
-	15, // 21: watch.v1.WatchService.CompareCursors:output_type -> watch.v1.CompareCursorsResponse
-	20, // [20:22] is the sub-list for method output_type
-	18, // [18:20] is the sub-list for method input_type
-	18, // [18:18] is the sub-list for extension type_name
-	18, // [18:18] is the sub-list for extension extendee
-	0,  // [0:18] is the sub-list for field type_name
+	19, // 8: watch.v1.Batch.commit_time:type_name -> google.protobuf.Timestamp
+	0,  // 9: watch.v1.Resync.reason:type_name -> watch.v1.ResyncReason
+	16, // 10: watch.v1.Row.values:type_name -> watch.v1.Row.ValuesEntry
+	1,  // 11: watch.v1.Change.operation:type_name -> watch.v1.Operation
+	17, // 12: watch.v1.Change.key:type_name -> watch.v1.Change.KeyEntry
+	18, // 13: watch.v1.Change.values:type_name -> watch.v1.Change.ValuesEntry
+	20, // 14: watch.v1.Value.null:type_name -> google.protobuf.NullValue
+	21, // 15: watch.v1.Value.unchanged_toast:type_name -> google.protobuf.Empty
+	2,  // 16: watch.v1.CompareCursorsResponse.order:type_name -> watch.v1.CursorOrder
+	13, // 17: watch.v1.Row.ValuesEntry.value:type_name -> watch.v1.Value
+	13, // 18: watch.v1.Change.ValuesEntry.value:type_name -> watch.v1.Value
+	3,  // 19: watch.v1.WatchService.Watch:input_type -> watch.v1.WatchRequest
+	14, // 20: watch.v1.WatchService.CompareCursors:input_type -> watch.v1.CompareCursorsRequest
+	4,  // 21: watch.v1.WatchService.Watch:output_type -> watch.v1.WatchResponse
+	15, // 22: watch.v1.WatchService.CompareCursors:output_type -> watch.v1.CompareCursorsResponse
+	21, // [21:23] is the sub-list for method output_type
+	19, // [19:21] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_api_watch_v1_watch_proto_init() }

@@ -37,6 +37,11 @@ source's identity. Cursors of one source are totally ordered, so across
 several scopes of one source the smallest `Progress` cursor is a consistent
 cut. A cursor from a different source is refused with `INVALID_ARGUMENT`.
 
+`Batch.commit_time` is when the transaction committed, by the source's
+clock. Use it to measure latency, such as commit to apply, bearing in mind
+clock skew between the source and the client. Never use it to order or to
+judge freshness: that is what cursors and `Progress` are for.
+
 ## Message sizes
 
 Snapshot rows are packed into messages of about 1 MiB. A `Batch` is one

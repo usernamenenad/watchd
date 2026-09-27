@@ -135,6 +135,36 @@ The four slot and retention gauges are sampled from `pg_replication_slots` every
 | `watchd.cdc.snapshot.active` | up-down counter | `{snapshot}` | `mode` | Scope reads in progress. |
 | `watchd.cdc.snapshot.errors` | counter | `{error}` | `mode`, `error_class` | Scope reads that failed. |
 
+### Hub: fan-out, replay, and watchers
+
+These metrics come from `internal/watch`. Per-watcher values are histograms sampled across all watchers, never series per watcher, so cardinality does not grow with watchers or scopes.
+
+| Metric | Type | Unit | Attributes | Meaning |
+| --- | --- | --- | --- | --- |
+| `watchd.hub.accept.duration` | histogram | `s` | | From a transaction reaching the hub until every relevant watcher has it queued, including the lock wait. Routing scans every watcher, so this grows with the watcher count. |
+| `watchd.hub.lock.wait` | histogram | `s` | | Time `Accept` waited for the hub's lock, held meanwhile by watchers registering, resuming, or reporting progress. `accept.duration − lock.wait` is fan-out work. |
+| `watchd.hub.replay.occupancy` | gauge | `{transaction}` | | Transactions in the replay window. |
+| `watchd.hub.replay.capacity` | gauge | `{transaction}` | | `MaxReplayTransactions`. |
+| `watchd.hub.replay.oldest_age` | gauge | `s` | | Age of the oldest transaction in the window, from its commit time: how far back a client can resume without a snapshot. |
+| `watchd.hub.replay.evictions` | counter | `{transaction}` | | Transactions evicted from the window. |
+| `watchd.hub.watchers` | gauge | `{watcher}` | | Registered watchers. |
+| `watchd.hub.watcher.queue_depth` | histogram | `{transaction}` | | Transactions still queued for a watcher each time it takes one. Near `WatcherQueue`, the watcher is about to be dropped. |
+| `watchd.hub.watcher.lag` | histogram | `By` | | WAL between the hub's newest transaction and each transaction a watcher takes from its queue. |
+| `watchd.hub.progress` | counter | `{event}` | | Progress events sent. |
+| `watchd.hub.resyncs` | counter | `{event}` | `reason` | Watches ended with Resync: `cursor_unavailable`, `slow_watcher` (a slow-watcher disconnect), `snapshot_window_closed`, or `source_stopped`. |
+
+### Server: the gRPC API
+
+| Metric | Type | Unit | Attributes | Meaning |
+| --- | --- | --- | --- | --- |
+| `watchd.server.streams.active` | up-down counter | `{stream}` | | Watch streams in progress. |
+| `watchd.server.send.duration` | histogram | `s` | | Time one stream message took to send. Long sends mean a slow reader: gRPC flow control holds the send until the client catches up. |
+| `watchd.server.snapshot.bytes` | counter | `By` | | Encoded bytes of snapshot rows sent. |
+| `watchd.server.batch.commit_to_send` | histogram | `s` | | From commit in PostgreSQL to the batch being sent. Subject to clock skew. |
+| `rpc.server.call.duration` | histogram | `s` | upstream: `rpc.method`, `rpc.response.status_code`, `rpc.system.name` | Per-RPC duration from the [OpenTelemetry gRPC instrumentation](https://pkg.go.dev/go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc). A `Watch` call lasts as long as its stream. Only registered methods are recorded, so a client cannot add `rpc.method` values. |
+
+Every `Batch` on the wire also carries `commit_time`, so clients can measure commit to apply themselves.
+
 ## Overhead
 
 Instrumentation adds no allocations on the hot path: each instrument and attribute set is created once, and counts are added once per transaction, not once per change. `BenchmarkConsumeTransaction` in `internal/cdc` measures the reader's per-transaction path (14 pgoutput messages: relation, BEGIN, 10 inserts, COMMIT; decode, sink, acknowledge):
@@ -146,4 +176,14 @@ Instrumentation adds no allocations on the hot path: each instrument and attribu
 
 The instrumented path costs about 2µs per transaction, mostly histogram recording and clock reads, and allocates nothing. The allocations are decoding's own. Measured with Go 1.27 on a 16-thread x86-64 machine. Run `go test ./internal/cdc -run '^$' -bench ConsumeTransaction -benchmem`.
 
-The hub, server, and SDK instruments are added by #56.
+`BenchmarkHubAccept` in `internal/watch` measures fanning one transaction out to N watchers:
+
+| Watchers | No-op meter | SDK meter | Allocations |
+| --- | --- | --- | --- |
+| 1 | ~310ns | ~480ns | 0 |
+| 100 | ~3.1µs | ~3.4µs | 0 |
+| 1,000 | ~28.6µs | ~29.2µs | 0 |
+
+The instruments cost a constant ~170ns per transaction: two histogram records and three clock reads. Routing itself is linear in watchers, because every watcher's scope is checked against every transaction. That is the first hot path to optimize under #57.
+
+The SDK instruments are added by #56.

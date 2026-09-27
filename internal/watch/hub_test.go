@@ -174,7 +174,7 @@ func accept(t *testing.T, hub *Hub, transactions ...cdc.Transaction) {
 }
 
 func batch(transaction cdc.Transaction, changes ...cdc.Change) Batch {
-	return Batch{Cursor: transaction.Cursor, Changes: changes}
+	return Batch{Cursor: transaction.Cursor, CommitTime: transaction.CommitTime, Changes: changes}
 }
 
 // TestSnapshotThenLiveDeliversExactlyWhatTheSnapshotLacks walks the snapshot

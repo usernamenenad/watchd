@@ -2,6 +2,7 @@ package watch
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/usernamenenad/watchd/internal/cdc"
 )
@@ -37,8 +38,11 @@ type SnapshotEnd struct{}
 type Batch struct {
 	// Cursor is the position just after the transaction. Once the batch is
 	// applied, a watcher may persist it and later resume from it.
-	Cursor  cdc.Cursor
-	Changes []cdc.Change
+	Cursor cdc.Cursor
+	// CommitTime is when the transaction committed, by the source's clock.
+	// It is informational, for measuring latency; order comes from Cursor.
+	CommitTime time.Time
+	Changes    []cdc.Change
 }
 
 // Progress states that every relevant committed change through Cursor has

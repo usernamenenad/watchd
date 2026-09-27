@@ -165,3 +165,21 @@ func TestParseCursorRoundTrips(t *testing.T) {
 		t.Fatalf("ParseCursor without source error = %v, want %v", err, ErrInvalidCursor)
 	}
 }
+
+func TestCursorBytesAfter(t *testing.T) {
+	a := Cursor{sourceID: "s", lsn: 100}
+	b := Cursor{sourceID: "s", lsn: 40}
+	for _, test := range []struct {
+		c, other Cursor
+		want     int64
+	}{
+		{a, b, 60},
+		{b, a, 0},
+		{a, a, 0},
+		{a, Cursor{sourceID: "other", lsn: 1}, 0},
+	} {
+		if got := test.c.BytesAfter(test.other); got != test.want {
+			t.Errorf("%v.BytesAfter(%v) = %d, want %d", test.c, test.other, got, test.want)
+		}
+	}
+}
