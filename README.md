@@ -12,7 +12,7 @@ It is deliberately not a task queue or a general-purpose event log. Its intended
 
 Applications running in pods can use the Go SDK to maintain a local projection of selected PostgreSQL state. When a pod starts or reconnects, it resumes from its last cursor when possible, or receives an explicit resync instruction and rebuilds from PostgreSQL. A pod should serve data as fresh only after it has received a progress statement for its watched scope.
 
-The initial version will run as a normal service deployed alongside applications. Kubernetes-specific packaging, dashboards, and an optional operator are follow-on work, not prerequisites for the core correctness model.
+The initial version runs as a normal service deployed alongside applications: a single daemon (the binary, or Docker Compose) or a Helm-deployed Kubernetes workload, from one container image (see [deploy](deploy/README.md)). Dashboards and an optional operator are follow-on work, not prerequisites for the core correctness model.
 
 ## Status
 
