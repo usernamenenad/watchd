@@ -66,6 +66,7 @@ When `watchd` cannot replay safely—for example, its bounded replay window was 
 - Only committed PostgreSQL changes are eligible for delivery.
 - A watcher must never observe a partial source transaction. Changes from one source transaction are delivered as an atomic batch.
 - Batches are ordered by committed source cursor for a single configured source.
+- A batch carries its transaction's commit time by the source's clock. It is informational, for measuring latency, and subject to clock skew between the source and the reader. Order and freshness come only from cursors, never from commit times.
 - Every scope of one configured source is derived from that source's single replication position, so all scopes of one source share one total order: batches delivered to any of that source's scopes are totally ordered by commit cursor, and cursors from different scopes of that source are mutually comparable.
 - A client watching several scopes `s1..sn` of one source may therefore compute the consistent cut `min(c1..cn)` over their progress cursors and treat it as a state that existed in the source, never a mixture that did not.
 - v0 makes no ordering or consistency claim across sources, across databases, or between a scope and an unrelated source. Comparing cursors from different sources is a caller error, and the API rejects it rather than returning a meaningless result.

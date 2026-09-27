@@ -7,6 +7,7 @@ package watch.v1;
 
 import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
 
 option go_package = "github.com/usernamenenad/watchd/api/watch/v1;watchv1";
 
@@ -76,6 +77,11 @@ message Batch {
   // batch, the client may persist it and resume from it.
   string cursor = 1;
   repeated Change changes = 2;
+  // commit_time is when the transaction committed, by the source's clock.
+  // It is informational, for measuring latency (it is subject to clock
+  // skew between the source and the client): order comes only from
+  // cursor. Unset when the server does not know it.
+  google.protobuf.Timestamp commit_time = 3;
 }
 
 // Progress states that every relevant committed change through cursor has

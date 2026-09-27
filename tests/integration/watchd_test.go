@@ -182,6 +182,7 @@ func checkOps(t *testing.T, opsURL string) {
 		"watchd_serving 1", "go_goroutine_count", `watchd_source_id="e2e"`,
 		`watchd_cdc_stream_state{state="streaming"} 1`, `watchd_cdc_snapshot_rows_total{mode="bootstrap"} 2`,
 		`watchd_cdc_snapshot_duration_seconds_count{mode="bootstrap"} 1`,
+		"watchd_hub_watchers 1", "watchd_server_streams_active 1", "watchd_hub_replay_capacity 10000",
 	} {
 		if !strings.Contains(metrics, want) {
 			t.Errorf("/metrics does not contain %q", want)

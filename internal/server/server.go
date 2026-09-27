@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
@@ -16,6 +18,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	watchv1 "github.com/usernamenenad/watchd/api/watch/v1"
 	"github.com/usernamenenad/watchd/internal/cdc"
@@ -45,6 +48,9 @@ type Config struct {
 	MaxRowsMessageBytes int
 	// Logger is optional. It never receives row values or scopes.
 	Logger *slog.Logger
+	// Meter is optional. The server's instruments are created from it once,
+	// in New; nil records nothing. See docs/observability.md.
+	Meter metric.Meter
 }
 
 // Server implements watch.v1.WatchService and the standard gRPC health
@@ -57,6 +63,7 @@ type Server struct {
 	maxRowsMessageBytes int
 	logger              *slog.Logger
 	health              *health.Server
+	metrics             *serverMetrics
 }
 
 // New creates a server. It reports NOT_SERVING until SetServing(true).
@@ -67,12 +74,17 @@ func New(cfg Config, watcher Watcher) (*Server, error) {
 	if cfg.MaxRowsMessageBytes == 0 {
 		cfg.MaxRowsMessageBytes = defaultMaxRowsMessageBytes
 	}
+	metrics, err := newServerMetrics(cfg.Meter)
+	if err != nil {
+		return nil, fmt.Errorf("server: create instruments: %w", err)
+	}
 	s := &Server{
 		sourceID:            cfg.SourceID,
 		watcher:             watcher,
 		maxRowsMessageBytes: cfg.MaxRowsMessageBytes,
 		logger:              cfg.Logger,
 		health:              health.NewServer(),
+		metrics:             metrics,
 	}
 	s.SetServing(false)
 	return s, nil
@@ -105,6 +117,10 @@ func (s *Server) Watch(req *watchv1.WatchRequest, stream grpc.ServerStreamingSer
 		}
 		resume = cursor.String()
 	}
+
+	ctx := stream.Context()
+	s.metrics.activeStreams.Add(ctx, 1)
+	defer s.metrics.activeStreams.Add(context.WithoutCancel(ctx), -1)
 
 	err := s.watcher.Watch(stream.Context(), watch.Request{
 		Projection:   req.GetProjection(),
@@ -141,13 +157,13 @@ func (s *Server) CompareCursors(_ context.Context, req *watchv1.CompareCursorsRe
 func (s *Server) send(stream grpc.ServerStreamingServer[watchv1.WatchResponse], event watch.Event) error {
 	switch event := event.(type) {
 	case watch.SnapshotBegin:
-		return stream.Send(&watchv1.WatchResponse{Event: &watchv1.WatchResponse_SnapshotBegin{SnapshotBegin: &watchv1.SnapshotBegin{}}})
+		return s.sendMessage(stream, &watchv1.WatchResponse{Event: &watchv1.WatchResponse_SnapshotBegin{SnapshotBegin: &watchv1.SnapshotBegin{}}})
 
 	case watch.SnapshotRows:
 		return s.sendRows(stream, event.Rows)
 
 	case watch.SnapshotEnd:
-		return stream.Send(&watchv1.WatchResponse{Event: &watchv1.WatchResponse_SnapshotEnd{SnapshotEnd: &watchv1.SnapshotEnd{}}})
+		return s.sendMessage(stream, &watchv1.WatchResponse{Event: &watchv1.WatchResponse_SnapshotEnd{SnapshotEnd: &watchv1.SnapshotEnd{}}})
 
 	case watch.Batch:
 		changes := make([]*watchv1.Change, 0, len(event.Changes))
@@ -158,18 +174,25 @@ func (s *Server) send(stream grpc.ServerStreamingServer[watchv1.WatchResponse], 
 			}
 			changes = append(changes, converted)
 		}
-		return stream.Send(&watchv1.WatchResponse{Event: &watchv1.WatchResponse_Batch{Batch: &watchv1.Batch{
-			Cursor:  s.encodeCursor(event.Cursor),
-			Changes: changes,
-		}}})
+		batch := &watchv1.Batch{Cursor: s.encodeCursor(event.Cursor), Changes: changes}
+		if !event.CommitTime.IsZero() {
+			batch.CommitTime = timestamppb.New(event.CommitTime)
+		}
+		if err := s.sendMessage(stream, &watchv1.WatchResponse{Event: &watchv1.WatchResponse_Batch{Batch: batch}}); err != nil {
+			return err
+		}
+		if !event.CommitTime.IsZero() {
+			s.metrics.commitToSend.Record(stream.Context(), time.Since(event.CommitTime).Seconds())
+		}
+		return nil
 
 	case watch.Progress:
-		return stream.Send(&watchv1.WatchResponse{Event: &watchv1.WatchResponse_Progress{Progress: &watchv1.Progress{
+		return s.sendMessage(stream, &watchv1.WatchResponse{Event: &watchv1.WatchResponse_Progress{Progress: &watchv1.Progress{
 			Cursor: s.encodeCursor(event.Cursor),
 		}}})
 
 	case watch.Resync:
-		return stream.Send(&watchv1.WatchResponse{Event: &watchv1.WatchResponse_Resync{Resync: &watchv1.Resync{
+		return s.sendMessage(stream, &watchv1.WatchResponse{Event: &watchv1.WatchResponse_Resync{Resync: &watchv1.Resync{
 			Reason: resyncReasons[event.Reason],
 		}}})
 
@@ -186,7 +209,10 @@ func (s *Server) sendRows(stream grpc.ServerStreamingServer[watchv1.WatchRespons
 		if len(message) == 0 {
 			return nil
 		}
-		err := stream.Send(&watchv1.WatchResponse{Event: &watchv1.WatchResponse_SnapshotRows{SnapshotRows: &watchv1.SnapshotRows{Rows: message}}})
+		err := s.sendMessage(stream, &watchv1.WatchResponse{Event: &watchv1.WatchResponse_SnapshotRows{SnapshotRows: &watchv1.SnapshotRows{Rows: message}}})
+		if err == nil {
+			s.metrics.snapshotBytes.Add(stream.Context(), int64(messageBytes))
+		}
 		message, messageBytes = nil, 0
 		return err
 	}
@@ -206,6 +232,15 @@ func (s *Server) sendRows(stream grpc.ServerStreamingServer[watchv1.WatchRespons
 		messageBytes += rowBytes
 	}
 	return flush()
+}
+
+// sendMessage sends one stream message, timing how long the send blocks:
+// gRPC flow control makes it wait for a client that reads slowly.
+func (s *Server) sendMessage(stream grpc.ServerStreamingServer[watchv1.WatchResponse], message *watchv1.WatchResponse) error {
+	started := time.Now()
+	err := stream.Send(message)
+	s.metrics.sendDuration.Record(stream.Context(), time.Since(started).Seconds())
+	return err
 }
 
 var resyncReasons = map[watch.ResyncReason]watchv1.ResyncReason{

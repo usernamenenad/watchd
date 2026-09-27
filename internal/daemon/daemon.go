@@ -11,8 +11,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel/metric"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/stats"
 
 	"github.com/usernamenenad/watchd/internal/cdc"
 	"github.com/usernamenenad/watchd/internal/ops"
@@ -107,18 +110,23 @@ func Serve(ctx context.Context, cfg Config, listeners Listeners, logger *slog.Lo
 		closeListeners()
 		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
 	}
-	hub, err = watch.New(cfg.hubConfig(), source)
+	hubConfig := cfg.hubConfig()
+	hubConfig.Meter = tel.Meter("github.com/usernamenenad/watchd/internal/watch")
+	hub, err = watch.New(hubConfig, source)
 	if err != nil {
 		closeListeners()
 		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
 	}
-	api, err := server.New(server.Config{SourceID: cfg.SourceID, Logger: logger}, hub)
+	api, err := server.New(server.Config{
+		SourceID: cfg.SourceID,
+		Logger:   logger,
+		Meter:    tel.Meter("github.com/usernamenenad/watchd/internal/server"),
+	}, hub)
 	if err != nil {
 		closeListeners()
 		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
 	}
-	grpcServer := grpc.NewServer()
-	api.Register(grpcServer)
+	grpcServer := newGRPCServer(tel.MeterProvider(), api.Register)
 
 	// One serving state backs gRPC health, /readyz, and watchd.serving.
 	var serving atomic.Bool
@@ -238,4 +246,28 @@ func stopOps(ctx context.Context, opsServer *http.Server, timeout time.Duration,
 		logger.Warn("ops endpoint did not stop in time", "error", err)
 		_ = opsServer.Close()
 	}
+}
+
+// newGRPCServer creates the API server with register's services, and with
+// per-RPC duration and status from the OpenTelemetry gRPC instrumentation.
+// Only RPCs to registered methods are recorded: the method attribute comes
+// from the request, so recording unknown methods would let any client add
+// series. grpc-go does not run stats handlers for unknown methods today; the
+// filter keeps that true regardless. watchd exports no traces, so the
+// instrumentation's spans go nowhere.
+func newGRPCServer(provider metric.MeterProvider, register func(grpc.ServiceRegistrar)) *grpc.Server {
+	// Filled in once the services are registered, before the server serves.
+	known := map[string]bool{}
+	grpcServer := grpc.NewServer(grpc.StatsHandler(otelgrpc.NewServerHandler(
+		otelgrpc.WithMeterProvider(provider),
+		otelgrpc.WithTracerProvider(tracenoop.NewTracerProvider()),
+		otelgrpc.WithFilter(func(info *stats.RPCTagInfo) bool { return known[info.FullMethodName] }),
+	)))
+	register(grpcServer)
+	for service, info := range grpcServer.GetServiceInfo() {
+		for _, method := range info.Methods {
+			known["/"+service+"/"+method.Name] = true
+		}
+	}
+	return grpcServer
 }

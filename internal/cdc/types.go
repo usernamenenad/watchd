@@ -116,6 +116,16 @@ func (c Cursor) Compare(other Cursor) (int, error) {
 	}
 }
 
+// BytesAfter reports how many bytes of source WAL lie between other and c:
+// 0 when c is not after other, or when they belong to different sources. It
+// is for measuring lag, never for ordering; use Compare to order cursors.
+func (c Cursor) BytesAfter(other Cursor) int64 {
+	if c.sourceID != other.sourceID || c.lsn <= other.lsn {
+		return 0
+	}
+	return int64(c.lsn - other.lsn)
+}
+
 // IsZero reports whether c is the zero Cursor, i.e. it was never assigned
 // from a Snapshot or Transaction.
 func (c Cursor) IsZero() bool {

@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
+
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/usernamenenad/watchd/internal/cdc"
 )
@@ -44,6 +47,9 @@ type Config struct {
 	// watcher. A watcher that falls further behind receives Resync instead
 	// of slowing the source.
 	WatcherQueue int
+	// Meter is optional. The hub's instruments are created from it once, in
+	// New; nil records nothing. See docs/observability.md.
+	Meter metric.Meter
 }
 
 // Request asks to watch one scope of one projection.
@@ -75,6 +81,7 @@ type Hub struct {
 	snapshotter Snapshotter
 	maxReplay   int
 	queueSize   int
+	metrics     *hubMetrics
 
 	mu sync.Mutex
 	// ring holds the most recent transactions, oldest first.
@@ -146,7 +153,7 @@ func New(cfg Config, snapshotter Snapshotter) (*Hub, error) {
 		projections[name] = projection{spec: spec, table: spec.Schema + "." + spec.Table}
 	}
 
-	return &Hub{
+	h := &Hub{
 		sourceID:    cfg.SourceID,
 		projections: projections,
 		snapshotter: snapshotter,
@@ -154,15 +161,26 @@ func New(cfg Config, snapshotter Snapshotter) (*Hub, error) {
 		queueSize:   cfg.WatcherQueue,
 		watchers:    make(map[*watcher]struct{}),
 		stopped:     make(chan struct{}),
-	}, nil
+	}
+	metrics, err := newHubMetrics(cfg.Meter, h)
+	if err != nil {
+		return nil, fmt.Errorf("watch: create instruments: %w", err)
+	}
+	h.metrics = metrics
+	return h, nil
 }
 
 // Accept is the source's TransactionSink. It records transaction in the
 // replay window and hands each watcher its part, and never blocks on a
 // watcher: one whose queue is full is dropped with Resync instead.
-func (h *Hub) Accept(_ context.Context, transaction cdc.Transaction) error {
+func (h *Hub) Accept(ctx context.Context, transaction cdc.Transaction) error {
+	started := time.Now()
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.metrics.lockWait.Record(ctx, time.Since(started).Seconds())
+	defer func() {
+		h.mu.Unlock()
+		h.metrics.acceptDuration.Record(ctx, time.Since(started).Seconds())
+	}()
 
 	if h.hasReceived {
 		order, err := transaction.Cursor.Compare(h.received)
@@ -220,6 +238,7 @@ func (h *Hub) Watch(ctx context.Context, req Request, send func(Event) error) er
 		wake:       make(chan struct{}, 1),
 		overflow:   make(chan struct{}),
 	}
+	send = h.metrics.countingSend(ctx, send)
 	select {
 	case <-h.stopped:
 		return send(Resync{Reason: ResyncSourceStopped})
@@ -359,6 +378,7 @@ func (h *Hub) live(ctx context.Context, w *watcher, base cdc.Cursor, baseSafe bo
 		// Every transaction accepted up to position has already been queued
 		// for w, so once the queue is drained, w is complete through it.
 		position, received := h.position()
+		newest := position
 		if !received || (baseSafe && later(base, position)) {
 			position = base
 		}
@@ -366,12 +386,17 @@ func (h *Hub) live(ctx context.Context, w *watcher, base cdc.Cursor, baseSafe bo
 		for drained := false; !drained; {
 			select {
 			case item := <-w.queue:
+				h.metrics.queueDepth.Record(ctx, int64(len(w.queue)))
+				if received {
+					// How far behind the hub this watcher was when it got here.
+					h.metrics.watcherLag.Record(ctx, newest.BytesAfter(item.transaction.Cursor))
+				}
 				deliver, err := need(item.transaction)
 				if err != nil {
 					return err
 				}
 				if deliver {
-					if err := send(Batch{Cursor: item.transaction.Cursor, Changes: item.changes}); err != nil {
+					if err := send(Batch{Cursor: item.transaction.Cursor, CommitTime: item.transaction.CommitTime, Changes: item.changes}); err != nil {
 						return err
 					}
 				}
@@ -442,6 +467,7 @@ func (h *Hub) evictLocked() {
 	h.ring = h.ring[1:]
 	h.lastEvicted = evicted
 	h.hasEvicted = true
+	h.metrics.evictions.Add(context.Background(), 1)
 	if h.hasFloor && later(evicted, h.floor) {
 		h.floor = evicted
 	}
@@ -461,7 +487,7 @@ func (h *Hub) unregister(w *watcher) {
 // appendBatch appends transaction's part for w to batches, if it has one.
 func (w *watcher) appendBatch(batches []Batch, transaction cdc.Transaction) []Batch {
 	if changes := w.projection.changes(w.scope, transaction); len(changes) > 0 {
-		batches = append(batches, Batch{Cursor: transaction.Cursor, Changes: changes})
+		batches = append(batches, Batch{Cursor: transaction.Cursor, CommitTime: transaction.CommitTime, Changes: changes})
 	}
 	return batches
 }
