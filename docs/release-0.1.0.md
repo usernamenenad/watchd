@@ -40,6 +40,7 @@ Correctness core:
 - #7 — Configuration: validated source and runtime configuration
 - #20 — Watch: progress for idle scopes
 - #33 — CDC: detect an incompatible relation change and force Resync
+- #64 — CDC: enforce the retained-WAL budget with a staged response
 - #53 — CDC: cap projections, scopes, watchers, and snapshots per source
 - #54 — Tests: a multi-scope client observes only consistent cuts
 
@@ -109,12 +110,13 @@ Second batch, split from closed issues or added for observability and deployment
 - #59 — **Deploy: run watchd as a standalone daemon with Docker Compose.** The reference single-daemon deployment, the rest of #35, and bare-binary docs.
 - #60 — **Deploy: Helm chart for Kubernetes.** Single replica with `Recreate`, gRPC probes, secret references, the restricted security context, NetworkPolicy, and ServiceMonitor.
 - #61 — **Tests: Kubernetes end-to-end on kind.** Install the chart, sync a consumer in the cluster, and resync correctly across a pod restart.
+- #64 — **CDC: enforce the retained-WAL budget with a staged response.** The rest of #22: warn, degrade, and terminal stages on top of the retained-WAL measurement from #56, plus orphan-slot cleanup.
 
 ## Order
 
 These dependencies constrain the sequence:
 
-- #55 precedes #56 and #5; #56 precedes #57, whose benchmarks measure instrumentation overhead too.
+- #55 precedes #56 and #5; #56 precedes #57, whose benchmarks measure instrumentation overhead too, and #64, which acts on #56's retention measurement.
 - #7 (file-mounted secrets, ops listener configuration) and #58 precede #59 and #60.
 - #52 precedes #60 exposing the gRPC port to other namespaces.
 - #60 precedes #61, and #61 precedes #8, which publishes what #61 has proven.
@@ -123,7 +125,7 @@ These dependencies constrain the sequence:
 | Phase | Work |
 | --- | --- |
 | A — Foundations | Done: #9, #22, #29, #30, #31, #32, #3, #4, #21 |
-| B — Correctness and safety | #7, #20, #33, #53, #54, #6 → #52 |
+| B — Correctness and safety | #7, #20, #33, #53, #54, #6 → #52, #56 → #64 |
 | C — Observability | #55 → #56 → #57, #5 |
 | D — Deployment | #58 → #59, #60 → #61 |
 | E — Ship | #34, #37, #36, #25 → #8 → tag |

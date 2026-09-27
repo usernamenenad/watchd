@@ -22,6 +22,8 @@ slot_name: watchd_example
 publication_name: watchd_publication
 listen_address: 127.0.0.1:7070
 shutdown_timeout: 10s
+ops:
+  listen_address: 127.0.0.1:9090
 projections:
   tenant_permissions:
     schema: public
@@ -39,6 +41,9 @@ The same configuration in JSON:
   "publication_name": "watchd_publication",
   "listen_address": "127.0.0.1:7070",
   "shutdown_timeout": "10s",
+  "ops": {
+    "listen_address": "127.0.0.1:9090"
+  },
   "projections": {
     "tenant_permissions": {
       "schema": "public",
@@ -57,21 +62,34 @@ The same configuration in JSON:
 | `publication_name` | The PostgreSQL publication to stream. It must publish `INSERT`, `UPDATE`, and `DELETE`, not `TRUNCATE`, and include every projection table. |
 | `listen_address` | Where the gRPC API listens. |
 | `shutdown_timeout` | How long a graceful shutdown may take. Default `10s`. |
+| `ops.listen_address` | Where the ops HTTP endpoint listens: `/metrics`, `/healthz`, `/readyz`. Omit it to disable the endpoint. |
+| `ops.pprof` | Serve `/debug/pprof/*` on the ops endpoint. Default `false`: profiles reveal internals. |
+| `ops.mutex_profile_fraction`, `ops.block_profile_rate` | Sampling rates for the mutex and block profiles (see `runtime.SetMutexProfileFraction` and `runtime.SetBlockProfileRate`). Default `0`, which leaves those profiles empty. They require `ops.pprof`. |
 | `projections` | The projections clients may watch, by name. `scope_column` must be one of `primary_key`. |
 
 The database URL comes only from `WATCHD_DATABASE_URL`, so the file never
 holds a credential. The role needs `REPLICATION` and `SELECT` on the
 projection tables.
 
+## Observability
+
+Metrics, health, and profiling are described in
+[docs/observability.md](../../docs/observability.md). In short: Prometheus
+scrapes `/metrics` on the ops endpoint, and setting
+`OTEL_METRICS_EXPORTER=otlp` also pushes to an OpenTelemetry collector
+configured by the standard `OTEL_EXPORTER_OTLP_*` variables.
+
 ## Lifecycle
 
 - **Startup:** validate the configuration, start the source (resume its slot,
   or wait for the first client to create it), serve the API, then report
-  `SERVING` on the gRPC health service.
-- **Shutdown** (SIGINT or SIGTERM): report `NOT_SERVING`, end every watch with
-  `Resync`, drain the server within `shutdown_timeout`, then stop the source.
-  Only transactions the process accepted are acknowledged to PostgreSQL, so
-  the next start resumes exactly where this one stopped.
+  `SERVING` on the gRPC health service and ready on `/readyz`. The ops
+  endpoint starts first, so `/healthz` answers throughout.
+- **Shutdown** (SIGINT or SIGTERM): report `NOT_SERVING` and not ready, end
+  every watch with `Resync`, drain the server within `shutdown_timeout`, then
+  stop the source. Only transactions the process accepted are acknowledged to
+  PostgreSQL, so the next start resumes exactly where this one stopped.
+  Pending OTLP metrics are pushed within the same timeout.
 - **Source failure** (for example an invalidated slot): the process shuts
   down the same way and exits with code 3.
 
