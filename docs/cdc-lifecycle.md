@@ -251,6 +251,20 @@ A cursor from `Snapshot` is only a safe resume boundary if the slot has retained
 
 `Snapshot` checks this before returning: it re-reads the slot's `restart_lsn` and compares it against the cursor it just captured. If the window has already closed, it returns `ErrSnapshotWindowClosed` instead of a boundary that looks usable but is not. The caller's only correct response is to call `Snapshot` again for a fresh cursor — there is no way to repair a closed window after the fact.
 
+## Putting it together: `Source`
+
+`cdc.Source` owns the reader and applies the rules above, so the runtime asks only for "a snapshot of this scope" and never chooses a primitive itself:
+
+| Situation | What `Source` does |
+| --- | --- |
+| `Start`, and the slot exists | Resumes it with `Run` |
+| `Start`, and there is no slot | Waits: no slot exists until a scope needs one, so none is ever forgotten |
+| First `Snapshot` on a source with no slot | `Bootstrap` creates the slot with that scope's rows, then `Run` consumes the stream `Bootstrap` started |
+| Every later `Snapshot` | `Reader.Snapshot` against the live slot, while `Run` keeps streaming |
+| `Run` ends (shutdown or a terminal error such as `ErrSlotInvalidated`) | `Done` closes, `Err` reports why, and later `Snapshot` calls fail with `ErrSourceStopped`, since rows without a live stream cannot stay fresh |
+
+After a process restart, `Start` finds the slot and resumes it; consumers then take fresh snapshots, because the process kept no replay history.
+
 ## What is implemented now, and what belongs above it
 
 The current code is the source-side CDC primitive. It provides a gap-free bootstrap boundary, transaction-aware decoding, sink-before-ack ordering, reconnect/resume behaviour, typed failures, and tests around the important races.
@@ -259,7 +273,7 @@ It is not yet the entire production watchd product. The higher-level runtime/con
 
 - durable local projection storage and persisted applied cursors;
 - a watch API and SDK that let applications register/query projections;
-- routing each scope's committed changes from the one shared stream to the right local projection, and retrying `Snapshot` when `ErrSnapshotWindowClosed` occurs;
+- routing each scope's committed changes from the one shared stream to the right local projection, applying `Snapshot.Covers` to transactions already streamed, and retrying `Snapshot` when `ErrSnapshotWindowClosed` occurs;
 - leader election or ownership so two replicas do not consume the same slot unintentionally;
 - explicit resync, source replacement, and orphan-slot cleanup after a hard crash;
 - operational monitoring for slot lag, retained WAL, failed sinks, and bootstrap progress;

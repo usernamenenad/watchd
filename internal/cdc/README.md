@@ -71,6 +71,39 @@ the snapshot; `Run` consumes that already-started stream. A later recovery
 with an existing usable slot calls `Run` directly; it never creates a missing
 slot.
 
+## Source: choosing Bootstrap, Snapshot, or Run
+
+`Source` owns one `Reader` and makes the choice between its primitives, so a
+runtime never has to:
+
+```go
+source, err := cdc.NewSource(readerConfig, hub.Accept)
+if err != nil {
+    return err
+}
+// Resumes an existing slot with Run, or waits for the first scope.
+if err := source.Start(ctx); err != nil {
+    return err
+}
+
+// First scope on a new source: Bootstrap creates the slot, then Run starts.
+// Every later scope: Snapshot against the live slot.
+snapshot, err := source.Snapshot(ctx, spec, cdc.Scope{Value: tenantID}, installRows)
+
+<-source.Done() // the stream ended; source.Err() says why
+```
+
+| Situation | Primitive `Source` uses |
+| --- | --- |
+| `Start`, slot exists | `Run`, resuming the slot |
+| `Start`, no slot | nothing yet: no bare slot is created |
+| First `Snapshot`, no slot | `Bootstrap`, then `Run` on the stream it hands over |
+| Any later `Snapshot` | `Reader.Snapshot`, while `Run` streams |
+| `Run` ends | `Done` closes; later `Snapshot` calls return `ErrSourceStopped` |
+
+Concurrent first scopes wait for the one that bootstraps instead of racing
+to create the slot.
+
 ## Snapshot boundary
 
 `Bootstrap` and `Snapshot` each return a `Snapshot` whose rows and the change
