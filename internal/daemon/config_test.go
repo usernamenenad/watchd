@@ -27,10 +27,10 @@ const validConfig = `{
   }
 }`
 
-func TestParseConfigAcceptsValidConfig(t *testing.T) {
-	cfg, err := ParseConfig(strings.NewReader(validConfig), secretURL)
+func TestParseJSONConfigAcceptsValidConfig(t *testing.T) {
+	cfg, err := ParseJSONConfig(strings.NewReader(validConfig), secretURL)
 	if err != nil {
-		t.Fatalf("ParseConfig: %v", err)
+		t.Fatalf("ParseJSONConfig: %v", err)
 	}
 	if cfg.DatabaseURL != secretURL || cfg.SourceID != "local" || len(cfg.Projections) != 1 {
 		t.Fatalf("config = %+v", cfg)
@@ -47,12 +47,12 @@ func TestExampleConfigIsValid(t *testing.T) {
 		t.Fatalf("open example: %v", err)
 	}
 	defer file.Close()
-	if _, err := ParseConfig(file, secretURL); err != nil {
+	if _, err := ParseJSONConfig(file, secretURL); err != nil {
 		t.Fatalf("example config: %v", err)
 	}
 }
 
-func TestParseConfigRejectsInvalidConfigWithoutLeakingTheURL(t *testing.T) {
+func TestParseJSONConfigRejectsInvalidConfigWithoutLeakingTheURL(t *testing.T) {
 	for name, test := range map[string]struct {
 		config string
 		url    string
@@ -68,7 +68,7 @@ func TestParseConfigRejectsInvalidConfigWithoutLeakingTheURL(t *testing.T) {
 		"bad duration":         {config: strings.Replace(validConfig, `"source_id"`, `"shutdown_timeout": "soon", "source_id"`, 1), url: secretURL},
 		"no projections":       {config: `{"source_id": "local", "slot_name": "s", "publication_name": "p", "listen_address": ":1", "projections": {}}`, url: secretURL},
 	} {
-		_, err := ParseConfig(strings.NewReader(test.config), test.url)
+		_, err := ParseJSONConfig(strings.NewReader(test.config), test.url)
 		if !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("%s: error = %v, want %v", name, err, ErrInvalidConfig)
 			continue

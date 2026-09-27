@@ -92,7 +92,7 @@ func LoadConfig(path string) (Config, error) {
 	databaseURL := os.Getenv(DatabaseURLEnv)
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".json":
-		return ParseConfig(file, databaseURL)
+		return ParseJSONConfig(file, databaseURL)
 	case ".yaml", ".yml":
 		return ParseYAMLConfig(file, databaseURL)
 	default:
@@ -113,12 +113,13 @@ func ParseYAMLConfig(r io.Reader, databaseURL string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("%w: %v", ErrInvalidConfig, err)
 	}
-	return ParseConfig(bytes.NewReader(converted), databaseURL)
+	return ParseJSONConfig(bytes.NewReader(converted), databaseURL)
 }
 
-// ParseConfig decodes and validates a configuration. Unknown fields are
-// rejected, so a misspelled setting fails loudly instead of being ignored.
-func ParseConfig(r io.Reader, databaseURL string) (Config, error) {
+// ParseJSONConfig decodes and validates a JSON configuration. Unknown fields
+// and repeated keys are rejected, so a mistyped setting fails loudly instead
+// of being ignored.
+func ParseJSONConfig(r io.Reader, databaseURL string) (Config, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return Config{}, fmt.Errorf("%w: %v", ErrInvalidConfig, err)

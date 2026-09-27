@@ -6,12 +6,12 @@ PostgreSQL source.
 ```bash
 make build
 WATCHD_DATABASE_URL=postgres://watchd_replicator:watchd_replicator@127.0.0.1:54329/watchd \
-  ./bin/watchd -config examples/postgres/watchd.json
+  ./bin/watchd --config examples/postgres/watchd.json
 ```
 
 ## Configuration
 
-A JSON or YAML file (`-config`, default `watchd.json`); the extension
+A JSON or YAML file (`--config` or `-c`, default `watchd.json`); the extension
 (`.json`, `.yaml`, or `.yml`) selects the format. Both forms have the same
 fields and are validated identically: unknown fields and repeated keys are
 rejected, so a mistyped setting fails loudly instead of being ignored.

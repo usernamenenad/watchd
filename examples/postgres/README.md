@@ -18,7 +18,7 @@ publication (see `testing/postgres/init.sql`).
 ```bash
 make build
 WATCHD_DATABASE_URL=postgres://watchd_replicator:watchd_replicator@127.0.0.1:54329/watchd \
-  ./bin/watchd -config examples/postgres/watchd.yaml
+  ./bin/watchd --config examples/postgres/watchd.yaml
 ```
 
 `watchd.json` is the same configuration in JSON; either works.
