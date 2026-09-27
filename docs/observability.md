@@ -87,4 +87,63 @@ Runtime and gRPC instrumentation keep their upstream OpenTelemetry names (`go.*`
 
 Both runtime histograms are re-bucketed from the runtime's roughly 160 buckets onto 1µs–1s bounds. Their sums are estimated from bucket lower edges, because the runtime records none.
 
-The instruments for the ingest-to-serve path are added by #56.
+### CDC: replication, decode, and retention
+
+These metrics come from `internal/cdc`. Every metric describes the process's one source, which the `watchd.source.id` resource attribute names, so none carries a `source` attribute.
+
+| Metric | Type | Unit | Attributes | Meaning |
+| --- | --- | --- | --- | --- |
+| `watchd.cdc.stream.state` | gauge | | `state` | 1 for the replication stream's current state (`idle`, `connecting`, `streaming`, `backing_off`, `stopped`, `failed`), 0 for the others. |
+| `watchd.cdc.lsn.received` | gauge | `By` | | WAL position of the newest message received. |
+| `watchd.cdc.lsn.acknowledged` | gauge | `By` | | WAL position last acknowledged to PostgreSQL. |
+| `watchd.cdc.lsn.server_wal_end` | gauge | `By` | | PostgreSQL's WAL end, as last reported on the stream (keepalives and WAL data). |
+| `watchd.cdc.wal_lag` | gauge | `By` | | `server_wal_end − received`: how far PostgreSQL is ahead of watchd. It grows when PostgreSQL produces WAL faster than watchd reads it, or when decoding lags. |
+| `watchd.cdc.ack_lag` | gauge | `By` | | `received − acknowledged`: work received but not yet accepted by the hub. A slow watcher never causes it, because the hub drops slow watchers instead of blocking. |
+| `watchd.cdc.reconnects` | counter | `{reconnect}` | | Reconnect attempts after a retryable failure. |
+| `watchd.cdc.stream.errors` | counter | `{error}` | `error_class` | Replication connections that ended in an error. |
+| `watchd.cdc.standby_status.duration` | histogram | `s` | | Time to send one acknowledgement. The protocol has no keepalive round trip to measure. |
+| `watchd.cdc.standby_status.interval` | histogram | `s` | | Time between acknowledgements. |
+| `watchd.cdc.messages` | counter | `{message}` | | pgoutput messages decoded. |
+| `watchd.cdc.wal.bytes` | counter | `By` | | pgoutput payload bytes decoded. |
+| `watchd.cdc.transactions` | counter | `{transaction}` | | Transactions accepted and acknowledged. |
+| `watchd.cdc.transaction.duration` | histogram | `s` | | From a transaction's BEGIN to its COMMIT being received and decoded. For a large transaction this includes streaming it from PostgreSQL. |
+| `watchd.cdc.transaction.changes` | histogram | `{change}` | | Row changes per transaction. The top bucket is `MaxTransactionChanges`. |
+| `watchd.cdc.transaction.size` | histogram | `By` | | Estimated in-memory size per transaction. The top bucket is `MaxTransactionBytes`. |
+| `watchd.cdc.decode.errors` | counter | `{error}` | | Messages that could not be decoded. |
+| `watchd.cdc.sink.duration` | histogram | `s` | | Time the hub takes to accept a transaction. Replication waits for it before acknowledging, so this is watchd's backpressure point. |
+| `watchd.cdc.commit_to_accept` | histogram | `s` | | From commit in PostgreSQL to acceptance by the hub. Subject to clock skew between PostgreSQL and watchd. |
+| `watchd.cdc.slot.retained_wal` | gauge | `By` | | WAL PostgreSQL retains for the slot: its current WAL position minus the slot's `restart_lsn`. |
+| `watchd.cdc.slot.safe_wal_size` | gauge | `By` | | WAL that can still be written before the slot is invalidated. Absent when the server's retention is unbounded. |
+| `watchd.cdc.slot.wal_status` | gauge | | `state` | 1 for the slot's `wal_status` (`reserved`, `extended`, `unreserved`, `lost`), 0 for the others. |
+| `watchd.cdc.retention.budget` | gauge | `By` | | The effective retained-WAL budget: the stricter of `MaxRetainedWALBytes` and `max_slot_wal_keep_size`. Enforcing it is #64. |
+
+The four slot and retention gauges are sampled from `pg_replication_slots` every 30 seconds while the stream runs, on a short-lived connection. They are absent until the first sample. `error_class` is one of:
+
+- `slot_invalidated`, `slot_in_use`, `slot_not_found`, `snapshot_window_closed`
+- `insufficient_privileges`, `source_unavailable`, `replication_ended`, `sink_rejected`
+- `transaction_too_large`, `malformed_data`, `unsupported_change`
+- `invalid_config`, `postgres_server`, `timeout`, `other`
+
+### CDC: scope reads
+
+| Metric | Type | Unit | Attributes | Meaning |
+| --- | --- | --- | --- | --- |
+| `watchd.cdc.snapshot.duration` | histogram | `s` | `mode` | Time to read one scope, for reads that succeed. `mode` is `bootstrap` (the read that creates the slot) or `snapshot`. |
+| `watchd.cdc.snapshot.page.duration` | histogram | `s` | `mode` | Time to fetch one keyset page (`SnapshotBatchRows` rows). |
+| `watchd.cdc.snapshot.rows` | counter | `{row}` | `mode` | Rows read. |
+| `watchd.cdc.snapshot.bytes` | counter | `By` | `mode` | Text bytes of rows read. |
+| `watchd.cdc.snapshot.active` | up-down counter | `{snapshot}` | `mode` | Scope reads in progress. |
+| `watchd.cdc.snapshot.errors` | counter | `{error}` | `mode`, `error_class` | Scope reads that failed. |
+
+## Overhead
+
+Instrumentation adds no allocations on the hot path: each instrument and attribute set is created once, and counts are added once per transaction, not once per change. `BenchmarkConsumeTransaction` in `internal/cdc` measures the reader's per-transaction path (14 pgoutput messages: relation, BEGIN, 10 inserts, COMMIT; decode, sink, acknowledge):
+
+| Meter | Time | Allocations |
+| --- | --- | --- |
+| No-op | ~13.9µs | 301 allocs, 13.3kB |
+| SDK | ~16.3µs | 301 allocs, 13.3kB |
+
+The instrumented path costs about 2µs per transaction, mostly histogram recording and clock reads, and allocates nothing. The allocations are decoding's own. Measured with Go 1.27 on a 16-thread x86-64 machine. Run `go test ./internal/cdc -run '^$' -bench ConsumeTransaction -benchmem`.
+
+The hub, server, and SDK instruments are added by #56.

@@ -28,6 +28,10 @@ func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope
 	if sink == nil {
 		return Snapshot{}, ErrSnapshotSinkRequired
 	}
+	// Registered first, so it runs last and sees the final error, including a
+	// failed slot cleanup.
+	observer := r.metrics.startSnapshot(ctx, modeBootstrap)
+	defer func() { observer.finish(ctx, err) }()
 	if err := r.validateSourceProjectionSpec(spec); err != nil {
 		return Snapshot{}, err
 	}
@@ -82,7 +86,7 @@ func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope
 	// The exported snapshot stays valid only until the replication
 	// connection runs its next command, so it is imported and fully read
 	// before replication starts on that connection.
-	visibility, err := r.readSnapshot(ctx, management, slot.SnapshotName, spec, scope, sink)
+	visibility, err := r.readSnapshot(ctx, management, slot.SnapshotName, spec, scope, observer, sink)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -95,7 +99,7 @@ func (r *Reader) Bootstrap(ctx context.Context, spec ProjectionSpec, scope Scope
 	r.bootstrapLSN = cursor
 	r.bootstrapMu.Unlock()
 	streamTransferred = true
-	r.setConnectionState("streaming")
+	r.setConnectionState(stateStreaming)
 
 	return newSnapshot(spec.SourceID, cursor, visibility), nil
 }

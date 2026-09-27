@@ -81,16 +81,20 @@ func TestSourceUsesBootstrapSnapshotAndRunAcrossRestart(t *testing.T) {
 	}
 }
 
-func startTestSource(t *testing.T, ctx context.Context, slotName string, sink TransactionSink) (*Source, func()) {
+func startTestSource(t *testing.T, ctx context.Context, slotName string, sink TransactionSink, configure ...func(*ReaderConfig)) (*Source, func()) {
 	t.Helper()
-	source, err := NewSource(ReaderConfig{
+	config := ReaderConfig{
 		DatabaseURL:     testReplicationURL,
 		SourceID:        "test-postgres",
 		SlotName:        slotName,
 		PublicationName: testPublication,
 		StatusInterval:  100 * time.Millisecond,
 		ShutdownTimeout: time.Second,
-	}, sink)
+	}
+	for _, apply := range configure {
+		apply(&config)
+	}
+	source, err := NewSource(config, sink)
 	if err != nil {
 		t.Fatalf("NewSource: %v", err)
 	}

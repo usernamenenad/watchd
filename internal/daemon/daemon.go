@@ -79,10 +79,27 @@ func Serve(ctx context.Context, cfg Config, listeners Listeners, logger *slog.Lo
 	}
 	timeout := time.Duration(cfg.ShutdownTimeout)
 
+	tel, err := telemetry.Setup(ctx, telemetry.Options{SourceID: cfg.SourceID, Prometheus: listeners.Ops != nil, Logger: logger})
+	if err != nil {
+		closeListeners()
+		if errors.Is(err, telemetry.ErrInvalidEnvironment) {
+			return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+		}
+		return fmt.Errorf("daemon: telemetry: %w", err)
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+		defer cancel()
+		if err := tel.Shutdown(flushCtx); err != nil {
+			logger.Warn("telemetry did not flush", "error", err)
+		}
+	}()
+
 	// The hub is the source's sink, and the source is the hub's snapshotter.
 	var hub *watch.Hub
 	readerConfig := cfg.readerConfig()
 	readerConfig.Logger = logger
+	readerConfig.Meter = tel.Meter("github.com/usernamenenad/watchd/internal/cdc")
 	source, err := cdc.NewSource(readerConfig, func(ctx context.Context, transaction cdc.Transaction) error {
 		return hub.Accept(ctx, transaction)
 	})
@@ -102,22 +119,6 @@ func Serve(ctx context.Context, cfg Config, listeners Listeners, logger *slog.Lo
 	}
 	grpcServer := grpc.NewServer()
 	api.Register(grpcServer)
-
-	tel, err := telemetry.Setup(ctx, telemetry.Options{SourceID: cfg.SourceID, Prometheus: listeners.Ops != nil, Logger: logger})
-	if err != nil {
-		closeListeners()
-		if errors.Is(err, telemetry.ErrInvalidEnvironment) {
-			return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
-		}
-		return fmt.Errorf("daemon: telemetry: %w", err)
-	}
-	defer func() {
-		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
-		defer cancel()
-		if err := tel.Shutdown(flushCtx); err != nil {
-			logger.Warn("telemetry did not flush", "error", err)
-		}
-	}()
 
 	// One serving state backs gRPC health, /readyz, and watchd.serving.
 	var serving atomic.Bool
