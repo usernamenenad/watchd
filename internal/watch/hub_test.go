@@ -241,6 +241,74 @@ func TestWatcherReceivesOnlyItsScopeAndProjection(t *testing.T) {
 	}
 }
 
+func TestWatchersOfOneScopeEachReceiveItsTransactions(t *testing.T) {
+	hub := newTestHub(t, &fakeSnapshotter{snapshot: cdc.NewSnapshotForTest(testSource, 50, 1, 1)})
+	a1 := startWatch(t, hub, Request{Projection: "permissions", Scope: tenantA})
+	a1.expect(t, SnapshotBegin{}, SnapshotRows{}, SnapshotEnd{}, Progress{Cursor: cursor(50)})
+	a2 := startWatch(t, hub, Request{Projection: "permissions", Scope: tenantA})
+	a2.expect(t, SnapshotBegin{}, SnapshotRows{}, SnapshotEnd{}, Progress{Cursor: cursor(50)})
+	b := startWatch(t, hub, Request{Projection: "permissions", Scope: tenantB})
+	b.expect(t, SnapshotBegin{}, SnapshotRows{}, SnapshotEnd{}, Progress{Cursor: cursor(50)})
+
+	t1 := transaction(100, 5, change(tenantA, "u1"), change(tenantB, "u1"), change(tenantA, "u2"))
+	accept(t, hub, t1)
+	a1.expect(t, batch(t1, change(tenantA, "u1"), change(tenantA, "u2")), Progress{Cursor: t1.Cursor})
+	a2.expect(t, batch(t1, change(tenantA, "u1"), change(tenantA, "u2")), Progress{Cursor: t1.Cursor})
+	b.expect(t, batch(t1, change(tenantB, "u1")), Progress{Cursor: t1.Cursor})
+
+	// One watcher leaving its scope leaves the others in it.
+	a1.cancel()
+	a1.expectEnd(t)
+	t2 := transaction(200, 6, change(tenantA, "u3"))
+	accept(t, hub, t2)
+	a2.expect(t, batch(t2, change(tenantA, "u3")), Progress{Cursor: t2.Cursor})
+	b.expect(t, Progress{Cursor: t2.Cursor})
+}
+
+// TestTransactionTouchingManyScopesKeepsEachScopesChangesInOrder covers
+// Accept's hashed lookup, used once a transaction touches more scopes than
+// it scans, with each scope's changes interleaved with the others'.
+func TestTransactionTouchingManyScopesKeepsEachScopesChangesInOrder(t *testing.T) {
+	hub := newTestHub(t, &fakeSnapshotter{snapshot: cdc.NewSnapshotForTest(testSource, 50, 1, 1)})
+	scopes := indexedDeliveries + 4
+	streams := make([]*watchStream, scopes)
+	for i := range streams {
+		streams[i] = startWatch(t, hub, Request{Projection: "permissions", Scope: fmt.Sprint("tenant-", i)})
+		streams[i].expect(t, SnapshotBegin{}, SnapshotRows{}, SnapshotEnd{}, Progress{Cursor: cursor(50)})
+	}
+	var changes []cdc.Change
+	for _, user := range []string{"u1", "u2"} {
+		for i := range scopes {
+			changes = append(changes, change(fmt.Sprint("tenant-", i), user))
+		}
+	}
+	many := transaction(100, 5, changes...)
+	accept(t, hub, many)
+	for i, stream := range streams {
+		tenant := fmt.Sprint("tenant-", i)
+		stream.expect(t, batch(many, change(tenant, "u1"), change(tenant, "u2")), Progress{Cursor: many.Cursor})
+	}
+}
+
+func TestProjectionsOfOneTableRouteByTheirOwnScopeColumn(t *testing.T) {
+	byUser := testSpec()
+	byUser.ScopeColumn = "user_id"
+	hub := newTestHub(t, &fakeSnapshotter{snapshot: cdc.NewSnapshotForTest(testSource, 50, 1, 1)}, func(cfg *Config) {
+		cfg.Projections["by-user"] = byUser
+	})
+	tenant := startWatch(t, hub, Request{Projection: "permissions", Scope: tenantA})
+	tenant.expect(t, SnapshotBegin{}, SnapshotRows{}, SnapshotEnd{}, Progress{Cursor: cursor(50)})
+	user := startWatch(t, hub, Request{Projection: "by-user", Scope: "u1"})
+	user.expect(t, SnapshotBegin{}, SnapshotRows{}, SnapshotEnd{}, Progress{Cursor: cursor(50)})
+
+	// The last change's user_id equals tenant A's scope value: it belongs to
+	// neither watcher, since each routes by its own scope column.
+	mixed := transaction(100, 5, change(tenantB, "u1"), change(tenantA, "u2"), change(tenantB, tenantA))
+	accept(t, hub, mixed)
+	tenant.expect(t, batch(mixed, change(tenantA, "u2")), Progress{Cursor: mixed.Cursor})
+	user.expect(t, batch(mixed, change(tenantB, "u1")), Progress{Cursor: mixed.Cursor})
+}
+
 // TestProgressAfterSnapshotNeverClaimsAheadOfTheStream checks the progress
 // point reported right after a snapshot: the snapshot cursor when nothing
 // has been streamed yet, but the stream's own position once it has - even
