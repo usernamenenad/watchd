@@ -143,7 +143,7 @@ These metrics come from `internal/watch`. Per-watcher values are histograms samp
 
 | Metric | Type | Unit | Attributes | Meaning |
 | --- | --- | --- | --- | --- |
-| `watchd.hub.accept.duration` | histogram | `s` | | From a transaction reaching the hub until every relevant watcher has it queued, including the lock wait. Routing scans every watcher, so this grows with the watcher count. |
+| `watchd.hub.accept.duration` | histogram | `s` | | From a transaction reaching the hub until every relevant watcher has it queued, including the lock wait. Watchers are indexed by table and scope, so this grows with the changes and the watchers they concern, not with the watcher count. |
 | `watchd.hub.lock.wait` | histogram | `s` | | Time `Accept` waited for the hub's lock, held meanwhile by watchers registering, resuming, or reporting progress. `accept.duration − lock.wait` is fan-out work. |
 | `watchd.hub.replay.occupancy` | gauge | `{transaction}` | | Transactions in the replay window. |
 | `watchd.hub.replay.capacity` | gauge | `{transaction}` | | `MaxReplayTransactions`. |
@@ -205,14 +205,15 @@ Instrumentation adds no allocations on the hot path: each instrument and attribu
 
 The instrumented path costs about 2µs per transaction, mostly histogram recording and clock reads, and allocates nothing. The allocations are decoding's own. Measured with Go 1.27 on a 16-thread x86-64 machine. Run `go test ./internal/cdc -run '^$' -bench ConsumeTransaction -benchmem`.
 
-`BenchmarkHubAccept` in `internal/watch` measures fanning one transaction out to N watchers:
+`BenchmarkHubAccept` in `internal/watch` measures fanning one two-change transaction out to N watchers. The transaction concerns either no watcher or the one watcher of a single scope:
 
-| Watchers | No-op meter | SDK meter | Allocations |
-| --- | --- | --- | --- |
-| 1 | ~310ns | ~480ns | 0 |
-| 100 | ~3.1µs | ~3.4µs | 0 |
-| 1,000 | ~28.6µs | ~29.2µs | 0 |
+| Watchers | Before #68 (no-op, none) | No-op, none | No-op, one scope | SDK, none | SDK, one scope |
+| --- | --- | --- | --- | --- | --- |
+| 1 | ~720ns | ~680ns | ~1.0µs | ~1.1µs | ~1.3µs |
+| 100 | ~6.7µs | ~580ns | ~1.0µs | ~950ns | ~1.4µs |
+| 1,000 | ~58µs | ~600ns | ~910ns | ~960ns | ~1.4µs |
+| 10,000 | ~680µs | ~550ns | ~860ns | ~870ns | ~1.2µs |
 
-The instruments cost a constant ~170ns per transaction: two histogram records and three clock reads. Routing itself is linear in watchers, because every watcher's scope is checked against every transaction. That is the first hot path to optimize under #57.
+Accept allocates nothing when a transaction concerns no watcher. When it concerns one or more, it allocates once for each scope it touches, for the changes that scope's watchers share. The instruments cost a roughly constant ~350ns per transaction: two histogram records and three clock reads. Before #68, routing checked every watcher's scope against every transaction, so its cost grew linearly with the number of watchers. Measured with Go 1.27 on a 16-thread i5-1250P laptop, where results vary by ±15%. Run `go test ./internal/watch -run '^$' -bench HubAccept -count=6` and compare runs with `benchstat`.
 
 The SDK instruments add two histogram records and two clock reads per batch applied.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -99,8 +100,43 @@ type Hub struct {
 	lastEvicted cdc.Cursor
 	hasEvicted  bool
 	watchers    map[*watcher]struct{}
-	stopped     chan struct{}
-	stopOnce    sync.Once
+	// routes indexes watchers by the table and scope their changes come
+	// from, so Accept only visits the watchers a transaction concerns.
+	routes map[string][]*route
+	// tick is closed on the next accepted transaction, waking every watcher
+	// waiting on it at once so it can report progress. tickTaken says whether
+	// any watcher has it: if none does, Accept keeps it rather than replacing
+	// it.
+	tick      chan struct{}
+	tickTaken bool
+	// deliveries, deliveryKeys, and deliveryIndex are Accept's scratch
+	// space, reused so a transaction that concerns no watcher allocates
+	// nothing.
+	deliveries    []delivery
+	deliveryKeys  []deliveryKey
+	deliveryIndex map[deliveryKey]int
+	stopped       chan struct{}
+	stopOnce      sync.Once
+}
+
+// route holds the watchers of one table whose projections share a scope
+// column, by scope value. A scope's slice is replaced, never modified in
+// place, so Accept can keep ranging over one while it drops a watcher.
+type route struct {
+	scopeColumn string
+	scopes      map[string][]*watcher
+}
+
+// delivery is one scope's part of a transaction, shared read-only by every
+// watcher of that scope.
+type delivery struct {
+	watchers []*watcher
+	changes  []cdc.Change
+}
+
+type deliveryKey struct {
+	route *route
+	scope string
 }
 
 // queued is a relevant transaction waiting for its watcher. The transaction
@@ -122,9 +158,6 @@ type watcher struct {
 	// queue receives this watcher's relevant transactions after it
 	// registers, with the changes that belong to it.
 	queue chan queued
-	// wake is signalled on every accepted transaction, relevant or not, so
-	// the watcher can report progress.
-	wake chan struct{}
 	// overflow is closed when the watcher's queue was full.
 	overflow chan struct{}
 }
@@ -160,7 +193,11 @@ func New(cfg Config, snapshotter Snapshotter) (*Hub, error) {
 		maxReplay:   cfg.MaxReplayTransactions,
 		queueSize:   cfg.WatcherQueue,
 		watchers:    make(map[*watcher]struct{}),
+		routes:      make(map[string][]*route),
+		tick:        make(chan struct{}),
 		stopped:     make(chan struct{}),
+
+		deliveryIndex: make(map[deliveryKey]int),
 	}
 	metrics, err := newHubMetrics(cfg.Meter, h)
 	if err != nil {
@@ -177,8 +214,14 @@ func (h *Hub) Accept(ctx context.Context, transaction cdc.Transaction) error {
 	started := time.Now()
 	h.mu.Lock()
 	h.metrics.lockWait.Record(ctx, time.Since(started).Seconds())
+	var tick chan struct{}
 	defer func() {
 		h.mu.Unlock()
+		// Waking watchers is left until the lock is free, so the watchers
+		// that report progress do not contend with Accept for it.
+		if tick != nil {
+			close(tick)
+		}
 		h.metrics.acceptDuration.Record(ctx, time.Since(started).Seconds())
 	}()
 
@@ -195,27 +238,75 @@ func (h *Hub) Accept(ctx context.Context, transaction cdc.Transaction) error {
 	}
 	h.received = transaction.Cursor
 	h.hasReceived = true
+	if h.tickTaken {
+		tick, h.tick, h.tickTaken = h.tick, make(chan struct{}), false
+	}
 
 	h.ring = append(h.ring, transaction)
 	for len(h.ring) > h.maxReplay {
 		h.evictLocked()
 	}
 
-	for w := range h.watchers {
-		if changes := w.projection.changes(w.scope, transaction); len(changes) > 0 {
-			select {
-			case w.queue <- queued{transaction: transaction, changes: changes}:
-			default:
-				h.dropLocked(w)
+	for _, change := range transaction.Changes {
+		for _, r := range h.routes[change.Table] {
+			scope := change.Key[r.scopeColumn]
+			watchers := r.scopes[scope]
+			if len(watchers) == 0 {
 				continue
 			}
-		}
-		select {
-		case w.wake <- struct{}{}:
-		default:
+			d := h.deliveryLocked(deliveryKey{route: r, scope: scope}, watchers)
+			d.changes = append(d.changes, change)
 		}
 	}
+	for i := range h.deliveries {
+		d := &h.deliveries[i]
+		for _, w := range d.watchers {
+			select {
+			case w.queue <- queued{transaction: transaction, changes: d.changes}:
+			default:
+				h.dropLocked(w)
+			}
+		}
+		*d = delivery{}
+	}
+	h.deliveries = h.deliveries[:0]
+	clear(h.deliveryKeys)
+	h.deliveryKeys = h.deliveryKeys[:0]
+	if len(h.deliveryIndex) > 0 {
+		clear(h.deliveryIndex)
+	}
 	return nil
+}
+
+// indexedDeliveries is how many scopes a transaction must touch before
+// Accept finds their deliveries by hashing instead of scanning.
+const indexedDeliveries = 8
+
+// deliveryLocked returns key's delivery in the transaction being accepted,
+// starting one for watchers if it has none yet.
+func (h *Hub) deliveryLocked(key deliveryKey, watchers []*watcher) *delivery {
+	// Most transactions touch few scopes, which a scan finds faster than a
+	// map; the newest first, as changes to one scope tend to be adjacent.
+	if len(h.deliveryKeys) <= indexedDeliveries {
+		for i := len(h.deliveryKeys) - 1; i >= 0; i-- {
+			if h.deliveryKeys[i] == key {
+				return &h.deliveries[i]
+			}
+		}
+	} else if i, ok := h.deliveryIndex[key]; ok {
+		return &h.deliveries[i]
+	}
+	h.deliveries = append(h.deliveries, delivery{watchers: watchers})
+	h.deliveryKeys = append(h.deliveryKeys, key)
+	switch n := len(h.deliveryKeys); {
+	case n == indexedDeliveries+1:
+		for i, key := range h.deliveryKeys {
+			h.deliveryIndex[key] = i
+		}
+	case n > indexedDeliveries+1:
+		h.deliveryIndex[key] = n - 1
+	}
+	return &h.deliveries[len(h.deliveries)-1]
 }
 
 // Stop ends every watch with Resync(ResyncSourceStopped) and refuses new
@@ -235,7 +326,6 @@ func (h *Hub) Watch(ctx context.Context, req Request, send func(Event) error) er
 		projection: projection,
 		scope:      req.Scope,
 		queue:      make(chan queued, h.queueSize),
-		wake:       make(chan struct{}, 1),
 		overflow:   make(chan struct{}),
 	}
 	send = h.metrics.countingSend(ctx, send)
@@ -274,7 +364,7 @@ func (h *Hub) resume(ctx context.Context, w *watcher, cursor cdc.Cursor, send fu
 			backlog = w.appendBatch(backlog, transaction)
 		}
 	}
-	h.watchers[w] = struct{}{}
+	h.registerLocked(w)
 	h.mu.Unlock()
 	defer h.unregister(w)
 
@@ -309,7 +399,7 @@ func (h *Hub) snapshot(ctx context.Context, w *watcher, send func(Event) error) 
 			streamedTransactions = append(streamedTransactions, transaction)
 		}
 	}
-	h.watchers[w] = struct{}{}
+	h.registerLocked(w)
 	h.mu.Unlock()
 	defer h.unregister(w)
 
@@ -377,7 +467,7 @@ func (h *Hub) live(ctx context.Context, w *watcher, base cdc.Cursor, baseSafe bo
 	for first := true; ; first = false {
 		// Every transaction accepted up to position has already been queued
 		// for w, so once the queue is drained, w is complete through it.
-		position, received := h.position()
+		position, received, tick := h.position()
 		newest := position
 		if !received || (baseSafe && later(base, position)) {
 			position = base
@@ -422,16 +512,18 @@ func (h *Hub) live(ctx context.Context, w *watcher, base cdc.Cursor, baseSafe bo
 			return send(Resync{Reason: ResyncSlowWatcher})
 		case <-h.stopped:
 			return send(Resync{Reason: ResyncSourceStopped})
-		case <-w.wake:
+		case <-tick:
 		}
 	}
 }
 
-// position reports the newest accepted transaction's cursor.
-func (h *Hub) position() (cdc.Cursor, bool) {
+// position reports the newest accepted transaction's cursor, and the tick
+// that closes when the next one is accepted.
+func (h *Hub) position() (cdc.Cursor, bool, <-chan struct{}) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.received, h.hasReceived
+	h.tickTaken = true
+	return h.received, h.hasReceived, h.tick
 }
 
 // replayableLocked reports whether the ring holds every transaction a
@@ -473,15 +565,55 @@ func (h *Hub) evictLocked() {
 	}
 }
 
-func (h *Hub) dropLocked(w *watcher) {
+// registerLocked adds w to the watchers Accept delivers to.
+func (h *Hub) registerLocked(w *watcher) {
+	h.watchers[w] = struct{}{}
+	r := h.routeLocked(w.projection)
+	// Clip, so the append copies instead of writing into a backing array
+	// Accept may be ranging over.
+	r.scopes[w.scope] = append(slices.Clip(r.scopes[w.scope]), w)
+}
+
+// routeLocked returns the route of p's table and scope column, creating it
+// if no watcher has needed it yet.
+func (h *Hub) routeLocked(p projection) *route {
+	for _, r := range h.routes[p.table] {
+		if r.scopeColumn == p.spec.ScopeColumn {
+			return r
+		}
+	}
+	r := &route{scopeColumn: p.spec.ScopeColumn, scopes: make(map[string][]*watcher)}
+	h.routes[p.table] = append(h.routes[p.table], r)
+	return r
+}
+
+// removeLocked removes w from the watchers Accept delivers to, and reports
+// whether it was still registered.
+func (h *Hub) removeLocked(w *watcher) bool {
+	if _, ok := h.watchers[w]; !ok {
+		return false
+	}
 	delete(h.watchers, w)
-	close(w.overflow)
+	r := h.routeLocked(w.projection)
+	remaining := slices.DeleteFunc(slices.Clone(r.scopes[w.scope]), func(other *watcher) bool { return other == w })
+	if len(remaining) == 0 {
+		delete(r.scopes, w.scope)
+	} else {
+		r.scopes[w.scope] = remaining
+	}
+	return true
+}
+
+func (h *Hub) dropLocked(w *watcher) {
+	if h.removeLocked(w) {
+		close(w.overflow)
+	}
 }
 
 func (h *Hub) unregister(w *watcher) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	delete(h.watchers, w)
+	h.removeLocked(w)
 }
 
 // appendBatch appends transaction's part for w to batches, if it has one.

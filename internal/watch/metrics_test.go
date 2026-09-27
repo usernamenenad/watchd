@@ -108,41 +108,61 @@ func TestHubMetricsCountSlowWatcherDrops(t *testing.T) {
 
 // BenchmarkHubAccept measures fanning one transaction out to many
 // watchers, with and without instruments; compare allocs/op between them.
-// Watchers here never drain, so each benchmark iteration uses a fresh
-// scope outside every watcher's: the cost measured is routing, the hub's
-// per-transaction scan of all watchers.
+// Each transaction's two changes concern either no watcher ("none") or the
+// one watcher of tenant-0 ("one-scope"), which the benchmark drains so it is
+// never dropped. Either way Accept's cost should not grow with the number
+// of watchers.
 func BenchmarkHubAccept(b *testing.B) {
-	for _, watchers := range []int{1, 100, 1000} {
-		for _, mode := range []string{"noop", "sdk"} {
-			b.Run(fmt.Sprintf("watchers=%d/%s", watchers, mode), func(b *testing.B) {
-				var meter metric.Meter
-				if mode == "sdk" {
-					meter = telemetrytest.New(b).Meter()
-				}
-				hub, err := New(Config{
-					SourceID:    testSource,
-					Projections: map[string]cdc.ProjectionSpec{"permissions": testSpec()},
-					Meter:       meter,
-				}, &fakeSnapshotter{})
-				if err != nil {
-					b.Fatal(err)
-				}
-				projection := hub.projections["permissions"]
-				for i := range watchers {
-					w := &watcher{projection: projection, scope: fmt.Sprintf("tenant-%d", i), queue: make(chan queued, 1), wake: make(chan struct{}, 1), overflow: make(chan struct{})}
-					hub.watchers[w] = struct{}{}
-				}
-				changes := []cdc.Change{change("elsewhere", "u1"), change("elsewhere", "u2")}
-				ctx := context.Background()
-				lsn := uint64(0)
-				b.ReportAllocs()
-				for b.Loop() {
-					lsn += 100
-					if err := hub.Accept(ctx, transaction(lsn, uint32(lsn), changes...)); err != nil {
+	for _, watchers := range []int{1, 100, 1000, 10000} {
+		for _, shape := range []string{"none", "one-scope"} {
+			for _, mode := range []string{"noop", "sdk"} {
+				b.Run(fmt.Sprintf("watchers=%d/%s/%s", watchers, shape, mode), func(b *testing.B) {
+					var meter metric.Meter
+					if mode == "sdk" {
+						meter = telemetrytest.New(b).Meter()
+					}
+					hub, err := New(Config{
+						SourceID:    testSource,
+						Projections: map[string]cdc.ProjectionSpec{"permissions": testSpec()},
+						Meter:       meter,
+					}, &fakeSnapshotter{})
+					if err != nil {
 						b.Fatal(err)
 					}
-				}
-			})
+					projection := hub.projections["permissions"]
+					var target *watcher
+					for i := range watchers {
+						w := &watcher{projection: projection, scope: fmt.Sprintf("tenant-%d", i), queue: make(chan queued, 1), overflow: make(chan struct{})}
+						hub.registerLocked(w)
+						if i == 0 {
+							target = w
+						}
+					}
+					scope := "elsewhere"
+					if shape == "one-scope" {
+						scope = target.scope
+					}
+					changes := []cdc.Change{change(scope, "u1"), change(scope, "u2")}
+					ctx := context.Background()
+					lsn := uint64(0)
+					b.ReportAllocs()
+					for b.Loop() {
+						lsn += 100
+						if err := hub.Accept(ctx, transaction(lsn, uint32(lsn), changes...)); err != nil {
+							b.Fatal(err)
+						}
+						select {
+						case <-target.queue:
+						default:
+						}
+					}
+					select {
+					case <-target.overflow:
+						b.Fatal("the drained watcher was dropped")
+					default:
+					}
+				})
+			}
 		}
 	}
 }
