@@ -20,4 +20,4 @@ Ship one focused use case: a tenant-scoped Go read-model/cache SDK with observab
 
 ## 4. Cloud-native integration
 
-Package `watchd` for Kubernetes as a standard Deployment and Service, with health/readiness endpoints, Prometheus metrics, and example application manifests. Evaluate an operator only after the normal deployment path and source lifecycle are well understood.
+Package `watchd` for Kubernetes as a standard Deployment and Service, with health/readiness endpoints, OpenTelemetry metrics exported to Prometheus or OTLP, a Helm chart, and example application manifests. Evaluate an operator only after the normal deployment path and source lifecycle are well understood.
