@@ -30,13 +30,13 @@ Bootstrap uses an exported PostgreSQL snapshot and its matching logical-replicat
 
 ## Watch runtime
 
-`internal/watch` will own an explicitly bounded, non-authoritative replay window and the lifecycle of watchers. A usable cursor can replay changes; an unavailable cursor produces `Resync`. The runtime must isolate slow watchers so they cannot block CDC ingestion or healthy watchers.
+`internal/watch` owns an explicitly bounded, non-authoritative replay window and the lifecycle of watchers. A usable cursor can replay changes; an unavailable cursor produces `Resync`. The runtime must isolate slow watchers so they cannot block CDC ingestion or healthy watchers.
 
 `Progress(scope, cursor)` is a correctness statement: all relevant committed changes through that cursor have been delivered. A connected client is not automatically fresh.
 
 ## Server and SDK
 
-`internal/server` will expose Snapshot and Watch operations without exposing PostgreSQL credentials or unrestricted SQL. The Go SDK will apply transaction batches idempotently, replace snapshots atomically, persist cursors, and expose explicit fresh/stale state.
+`internal/server` exposes the Watch operation, with its snapshot, over gRPC without exposing PostgreSQL credentials or unrestricted SQL. The Go SDK applies transaction batches idempotently, replaces snapshots atomically, persists cursors, and exposes explicit fresh/stale state.
 
 ## Failure model
 
@@ -44,7 +44,8 @@ The v0 runtime is single-process soft state. On restart or an unreplayable curso
 
 ## Package boundaries
 
-- `cmd/watchd`: process construction and lifecycle only.
+- `cmd/watchd`: the executable: flags, signals, exit codes.
+- `internal/daemon`: process construction and lifecycle - configuration, startup and shutdown ordering.
 - `internal/cdc`: PostgreSQL protocol, snapshots, and committed source transactions.
 - `internal/watch`: source-independent replay and watcher state.
 - `internal/server`: transport adapters, authentication hooks, and operational endpoints.

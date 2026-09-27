@@ -86,6 +86,14 @@ func (r *Reader) validateProjectionSpec(ctx context.Context, management *pgx.Con
 	return nil
 }
 
+// ValidateProjectionSpec checks spec's static configuration - identifiers,
+// a primary key, and a scope column that is part of it - without connecting
+// to PostgreSQL. Snapshot and Bootstrap additionally check spec against the
+// live source.
+func ValidateProjectionSpec(spec ProjectionSpec) error {
+	return validateProjectionSpecConfig(spec)
+}
+
 func validateProjectionSpecConfig(spec ProjectionSpec) error {
 	if spec.SourceID == "" || spec.Schema == "" || spec.Table == "" || spec.ScopeColumn == "" || len(spec.PrimaryKey) == 0 {
 		return ErrInvalidReaderConfig
