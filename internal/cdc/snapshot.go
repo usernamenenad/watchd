@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
@@ -25,10 +26,12 @@ import (
 // after it. Snapshot checks that and returns ErrSnapshotWindowClosed if the
 // slot has already moved past Cursor - the caller should just retry with a
 // fresh snapshot.
-func (r *Reader) Snapshot(ctx context.Context, spec ProjectionSpec, scope Scope, sink SnapshotRowSink) (Snapshot, error) {
+func (r *Reader) Snapshot(ctx context.Context, spec ProjectionSpec, scope Scope, sink SnapshotRowSink) (_ Snapshot, err error) {
 	if sink == nil {
 		return Snapshot{}, ErrSnapshotSinkRequired
 	}
+	observer := r.metrics.startSnapshot(ctx, modeSnapshot)
+	defer func() { observer.finish(ctx, err) }()
 	if err := r.validateSourceProjectionSpec(spec); err != nil {
 		return Snapshot{}, err
 	}
@@ -71,7 +74,7 @@ func (r *Reader) Snapshot(ctx context.Context, spec ProjectionSpec, scope Scope,
 		return Snapshot{}, fmt.Errorf("%w: invalid snapshot cursor", ErrPostgresServer)
 	}
 
-	visibility, err := r.readSnapshot(ctx, management, "", spec, scope, sink)
+	visibility, err := r.readSnapshot(ctx, management, "", spec, scope, observer, sink)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -133,6 +136,7 @@ func (r *Reader) readSnapshot(
 	importSnapshot string,
 	spec ProjectionSpec,
 	scope Scope,
+	observer *snapshotObserver,
 	sink SnapshotRowSink,
 ) (*visibility, error) {
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
@@ -173,7 +177,7 @@ func (r *Reader) readSnapshot(
 		}
 	}
 
-	if err := scanScopedRows(ctx, tx, spec, scope, r.config.SnapshotBatchRows, sink); err != nil {
+	if err := scanScopedRows(ctx, tx, spec, scope, r.config.SnapshotBatchRows, observer, observer.sink(sink)); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -188,7 +192,7 @@ func (r *Reader) readSnapshot(
 // scoped result set in memory. Every batch runs inside tx's existing
 // snapshot, so pagination sees no more or less than a single unbounded read
 // of the same scope would have.
-func scanScopedRows(ctx context.Context, tx pgx.Tx, spec ProjectionSpec, scope Scope, batchRows int, sink SnapshotRowSink) error {
+func scanScopedRows(ctx context.Context, tx pgx.Tx, spec ProjectionSpec, scope Scope, batchRows int, observer *snapshotObserver, sink SnapshotRowSink) error {
 	tableName := pgx.Identifier{spec.Schema, spec.Table}.Sanitize()
 	scopeColumn := pgx.Identifier{spec.ScopeColumn}.Sanitize()
 	pkColumns := make([]string, len(spec.PrimaryKey))
@@ -245,10 +249,12 @@ func scanScopedRows(ctx context.Context, tx pgx.Tx, spec ProjectionSpec, scope S
 
 	var lastKey []string
 	for {
+		started := time.Now()
 		batch, err := fetchBatch(lastKey)
 		if err != nil {
 			return err
 		}
+		observer.page(ctx, time.Since(started))
 		if len(batch) == 0 {
 			return nil
 		}

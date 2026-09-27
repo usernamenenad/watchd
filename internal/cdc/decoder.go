@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"time"
 
 	"github.com/jackc/pglogrepl"
 )
@@ -54,6 +55,7 @@ type Decoder struct {
 	relations             map[uint32]*pglogrepl.RelationMessage
 	pending               []Change
 	pendingXid            uint32
+	pendingCommitTime     time.Time
 	pendingBytes          int
 	maxTransactionBytes   int
 	maxTransactionChanges int
@@ -103,6 +105,7 @@ func (d *Decoder) Consume(message pglogrepl.Message) (*Transaction, error) {
 		}
 		d.pending = make([]Change, 0)
 		d.pendingXid = message.Xid
+		d.pendingCommitTime = message.CommitTime
 		d.pendingBytes = 0
 		return nil, nil
 
@@ -134,10 +137,11 @@ func (d *Decoder) Consume(message pglogrepl.Message) (*Transaction, error) {
 		// The Decoder does not know which source it reads; the Reader stamps
 		// the cursor's source ID before handing the transaction to its sink.
 		transaction := &Transaction{
-			Cursor:    Cursor{lsn: message.TransactionEndLSN},
-			Changes:   append([]Change(nil), d.pending...),
-			commitLSN: message.CommitLSN,
-			xid:       d.pendingXid,
+			Cursor:     Cursor{lsn: message.TransactionEndLSN},
+			Changes:    append([]Change(nil), d.pending...),
+			CommitTime: d.pendingCommitTime,
+			commitLSN:  message.CommitLSN,
+			xid:        d.pendingXid,
 		}
 		d.pending = nil
 		d.pendingBytes = 0

@@ -2,6 +2,7 @@ package cdc
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"sync"
@@ -42,6 +43,7 @@ type Reader struct {
 
 	statsMu sync.RWMutex
 	stats   ReaderStats
+	metrics *readerMetrics
 
 	bootstrapMu     sync.Mutex
 	bootstrapStream *CDC
@@ -62,8 +64,14 @@ func NewReader(config ReaderConfig, sink TransactionSink) (*Reader, error) {
 		return nil, err
 	}
 
+	metrics, err := newReaderMetrics(config.Meter, config)
+	if err != nil {
+		return nil, fmt.Errorf("cdc: create instruments: %w", err)
+	}
+
 	return &Reader{
 		config:            config,
+		metrics:           metrics,
 		sink:              sink,
 		connect:           Connect,
 		connectManagement: connectManagement,
@@ -72,7 +80,7 @@ func NewReader(config ReaderConfig, sink TransactionSink) (*Reader, error) {
 		now:               time.Now,
 		random:            rand.Float64,
 		stats: ReaderStats{
-			ConnectionState: "idle",
+			ConnectionState: stateIdle,
 		},
 	}, nil
 }
@@ -90,6 +98,7 @@ func (r *Reader) setConnectionState(state string) {
 	defer r.statsMu.Unlock()
 
 	r.stats.ConnectionState = state
+	r.metrics.setState(state)
 }
 
 func (r *Reader) setLastReceivedLSN(lsn pglogrepl.LSN) {
@@ -97,6 +106,7 @@ func (r *Reader) setLastReceivedLSN(lsn pglogrepl.LSN) {
 	defer r.statsMu.Unlock()
 
 	r.stats.LastReceivedLSN = lsn.String()
+	r.metrics.receivedLSN.Store(uint64(lsn))
 }
 
 func (r *Reader) setLastAcknowledgedLSN(lsn pglogrepl.LSN) {
@@ -104,6 +114,7 @@ func (r *Reader) setLastAcknowledgedLSN(lsn pglogrepl.LSN) {
 	defer r.statsMu.Unlock()
 
 	r.stats.LastAcknowledgedLSN = lsn.String()
+	r.metrics.ackedLSN.Store(uint64(lsn))
 }
 
 func (r *Reader) setInFlight(changes, bytes int) {
@@ -133,6 +144,7 @@ func (r *Reader) incrementDecodeErrors() {
 	defer r.statsMu.Unlock()
 
 	r.stats.DecodeErrors++
+	r.metrics.decodeErrors.Add(context.Background(), 1)
 }
 
 func (r *Reader) incrementReconnects() {
@@ -140,6 +152,7 @@ func (r *Reader) incrementReconnects() {
 	defer r.statsMu.Unlock()
 
 	r.stats.ReconnectAttempts++
+	r.metrics.reconnects.Add(context.Background(), 1)
 }
 
 func (r *Reader) log(ctx context.Context, level slog.Level, message string, args ...any) {

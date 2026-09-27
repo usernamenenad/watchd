@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"regexp"
 	"time"
+
+	"go.opentelemetry.io/otel/metric"
 )
 
 const (
@@ -74,6 +76,13 @@ type ReaderConfig struct {
 	// check is repeated during Run, so a live server-side config reload is
 	// noticed without a new Bootstrap.
 	RetentionCheckInterval time.Duration
+	// RetentionSampleInterval controls how often Run reads the slot's retained
+	// WAL from pg_replication_slots for the retention metrics.
+	RetentionSampleInterval time.Duration
+
+	// Meter is optional. The reader's instruments are created from it once,
+	// in NewReader; nil records nothing. See docs/observability.md.
+	Meter metric.Meter
 
 	// Logger is optional. It never receives DatabaseURL, credentials, row
 	// values, tenant identifiers, or other projection data.
@@ -108,6 +117,9 @@ func normalizeReaderConfig(config ReaderConfig) ReaderConfig {
 	if config.RetentionCheckInterval == 0 {
 		config.RetentionCheckInterval = defaultRetentionCheckInterval
 	}
+	if config.RetentionSampleInterval == 0 {
+		config.RetentionSampleInterval = defaultRetentionSampleInterval
+	}
 	if config.RetryPolicy.InitialBackoff == 0 {
 		config.RetryPolicy.InitialBackoff = defaultInitialBackoff
 	}
@@ -133,7 +145,7 @@ func validateReaderConfig(config ReaderConfig, sink TransactionSink) error {
 	if config.MaxTransactionBytes <= 0 || config.MaxTransactionChanges <= 0 || config.MaxValueBytes <= 0 || config.SnapshotBatchRows <= 0 || config.ConnectionTimeout <= 0 || config.StatusInterval <= 0 || config.ShutdownTimeout <= 0 {
 		return ErrInvalidReaderConfig
 	}
-	if config.MaxRetainedWALBytes <= 0 || config.RetentionCheckInterval <= 0 {
+	if config.MaxRetainedWALBytes <= 0 || config.RetentionCheckInterval <= 0 || config.RetentionSampleInterval <= 0 {
 		return ErrInvalidReaderConfig
 	}
 	if config.MaxValueBytes > config.MaxTransactionBytes {

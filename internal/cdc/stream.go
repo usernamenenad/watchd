@@ -21,22 +21,23 @@ func (r *Reader) Run(ctx context.Context) error {
 	go r.monitorRetentionBudget(monitorCtx)
 
 	for attempts := 0; ; {
-		r.setConnectionState("connecting")
+		r.setConnectionState(stateConnecting)
 		err := r.read(ctx)
 		if ctx.Err() != nil {
-			r.setConnectionState("stopped")
+			r.setConnectionState(stateStopped)
 			return nil
 		}
 		if err == nil {
-			r.setConnectionState("stopped")
+			r.setConnectionState(stateStopped)
 			return nil
 		}
+		r.metrics.streamError(ctx, err)
 		if !isRetryable(err) {
-			r.setConnectionState("failed")
+			r.setConnectionState(stateFailed)
 			return err
 		}
 		if attempts >= r.config.RetryPolicy.MaxAttempts {
-			r.setConnectionState("failed")
+			r.setConnectionState(stateFailed)
 			return fmt.Errorf("%w: %v", ErrRetryExhausted, err)
 		}
 
@@ -44,13 +45,13 @@ func (r *Reader) Run(ctx context.Context) error {
 		r.incrementReconnects()
 		delay := r.retryDelay(attempts)
 		r.log(ctx, slog.LevelWarn, "PostgreSQL logical replication connection lost; retrying", "attempt", attempts, "delay", delay, "error", err)
-		r.setConnectionState("backing_off")
+		r.setConnectionState(stateBackingOff)
 		if err := r.wait(ctx, delay); err != nil {
 			if ctx.Err() != nil {
-				r.setConnectionState("stopped")
+				r.setConnectionState(stateStopped)
 				return nil
 			}
-			r.setConnectionState("failed")
+			r.setConnectionState(stateFailed)
 			return err
 		}
 	}
@@ -61,7 +62,7 @@ func (r *Reader) Run(ctx context.Context) error {
 func (r *Reader) read(ctx context.Context) error {
 	if stream, startLSN, ok := r.takeBootstrapStream(); ok {
 		defer r.closeReplicationConnection(stream)
-		r.setConnectionState("streaming")
+		r.setConnectionState(stateStreaming)
 		decoder := NewDecoderWithLimits(r.config.MaxTransactionBytes, r.config.MaxTransactionChanges, r.config.MaxValueBytes)
 		return r.receive(ctx, stream.Conn(), decoder, startLSN)
 	}
@@ -83,7 +84,7 @@ func (r *Reader) read(ctx context.Context) error {
 	}
 
 	r.log(ctx, slog.LevelInfo, "PostgreSQL logical replication started", "slot", r.config.SlotName, "start_lsn", startLSN.String())
-	r.setConnectionState("streaming")
+	r.setConnectionState(stateStreaming)
 	decoder := NewDecoderWithLimits(r.config.MaxTransactionBytes, r.config.MaxTransactionChanges, r.config.MaxValueBytes)
 	return r.receive(ctx, conn, decoder, startLSN)
 }
@@ -122,6 +123,9 @@ func (r *Reader) takeBootstrapStream() (*CDC, pglogrepl.LSN, bool) {
 func (r *Reader) receive(ctx context.Context, conn *pgconn.PgConn, decoder *Decoder, initialLSN pglogrepl.LSN) error {
 	safeLSN := initialLSN
 	nextStatus := r.now().Add(r.config.StatusInterval)
+	// A new connection starts with a new decoder; drop any partial
+	// transaction's tallies from the last one.
+	r.metrics.pendingMessages, r.metrics.pendingBytes, r.metrics.beganAt = 0, 0, time.Time{}
 
 	for {
 		receiveCtx, cancel := context.WithDeadline(ctx, nextStatus)
@@ -189,11 +193,24 @@ func (r *Reader) consumeCopyData(
 			return ErrTransactionTooLarge
 		}
 		r.setLastReceivedLSN(xlog.WALStart)
+		r.observeServerWALEnd(xlog.ServerWALEnd)
 
 		message, err := pglogrepl.Parse(xlog.WALData)
 		if err != nil {
 			r.incrementDecodeErrors()
 			return fmt.Errorf("%w: parse pgoutput", ErrMalformedReplicationData)
+		}
+
+		metrics := r.metrics
+		metrics.pendingMessages++
+		metrics.pendingBytes += int64(len(xlog.WALData))
+		var committedBytes int
+		switch message.(type) {
+		case *pglogrepl.BeginMessage:
+			metrics.beganAt = r.now()
+		case *pglogrepl.CommitMessage:
+			// Consume resets the pending footprint at COMMIT; read it first.
+			_, committedBytes = decoder.Pending()
 		}
 
 		transaction, err := decoder.Consume(message)
@@ -214,10 +231,25 @@ func (r *Reader) consumeCopyData(
 		r.incrementTransactionsReceived()
 		transaction.Cursor.sourceID = r.config.SourceID
 
+		decoded := r.now()
+		if !metrics.beganAt.IsZero() {
+			metrics.txDuration.Record(ctx, decoded.Sub(metrics.beganAt).Seconds())
+		}
+		metrics.txChanges.Record(ctx, int64(len(transaction.Changes)))
+		metrics.txBytes.Record(ctx, int64(committedBytes))
+		metrics.messages.Add(ctx, metrics.pendingMessages)
+		metrics.walBytes.Add(ctx, metrics.pendingBytes)
+		metrics.pendingMessages, metrics.pendingBytes, metrics.beganAt = 0, 0, time.Time{}
+
 		// A nil sink result is the local replay-buffer acceptance boundary. If it
 		// fails, safeLSN must not move and PostgreSQL will replay this batch.
 		if err := r.sink(ctx, *transaction); err != nil {
 			return fmt.Errorf("%w: %w", ErrSinkRejected, err)
+		}
+		accepted := r.now()
+		metrics.sinkDuration.Record(ctx, accepted.Sub(decoded).Seconds())
+		if !transaction.CommitTime.IsZero() {
+			metrics.commitToSink.Record(ctx, accepted.Sub(transaction.CommitTime).Seconds())
 		}
 
 		// TransactionEndLSN, not ServerWALEnd, is the point after the complete
@@ -227,6 +259,7 @@ func (r *Reader) consumeCopyData(
 			return classifyPostgresError(err)
 		}
 		r.incrementTransactionsAccepted()
+		metrics.transactions.Add(ctx, 1)
 		r.setLastAcknowledgedLSN(*safeLSN)
 		return nil
 
@@ -235,6 +268,8 @@ func (r *Reader) consumeCopyData(
 		if err != nil {
 			return fmt.Errorf("%w: parse primary keepalive", ErrMalformedReplicationData)
 		}
+
+		r.observeServerWALEnd(keepalive.ServerWALEnd)
 
 		// Keepalives carry no source mutation. Reply with safeLSN only when the
 		// server asks; never advance it to keepalive.ServerWALEnd.
@@ -251,11 +286,25 @@ func (r *Reader) consumeCopyData(
 }
 
 func (r *Reader) acknowledge(ctx context.Context, conn *pgconn.PgConn, safeLSN pglogrepl.LSN) error {
+	started := r.now()
 	err := r.sendStandbyStatus(ctx, conn, safeLSN)
 	if err == nil {
+		now := r.now()
+		r.metrics.statusSent(ctx, now, now.Sub(started))
 		r.setLastAcknowledgedLSN(safeLSN)
 	}
 	return err
+}
+
+// observeServerWALEnd records PostgreSQL's WAL end as reported on the
+// stream. It never moves backwards: a reconnect may report an older one.
+func (r *Reader) observeServerWALEnd(lsn pglogrepl.LSN) {
+	for {
+		current := r.metrics.serverWALEnd.Load()
+		if uint64(lsn) <= current || r.metrics.serverWALEnd.CompareAndSwap(current, uint64(lsn)) {
+			return
+		}
+	}
 }
 
 func sendStandbyStatus(ctx context.Context, conn *pgconn.PgConn, safeLSN pglogrepl.LSN) error {

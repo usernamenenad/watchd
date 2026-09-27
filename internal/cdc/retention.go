@@ -2,6 +2,7 @@ package cdc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -20,6 +21,9 @@ const (
 	// server's max_slot_wal_keep_size, so a live Postgres config reload is
 	// noticed without waiting for the next Bootstrap.
 	defaultRetentionCheckInterval = 5 * time.Minute
+	// defaultRetentionSampleInterval bounds how stale the retained-WAL
+	// metrics can be.
+	defaultRetentionSampleInterval = 30 * time.Second
 )
 
 // walKeepSizeUnitMultipliers converts pg_settings.unit for
@@ -32,35 +36,94 @@ var walKeepSizeUnitMultipliers = map[string]int64{
 	"TB": 1024 * 1024 * 1024 * 1024,
 }
 
-// monitorRetentionBudget periodically re-reads the server's
-// max_slot_wal_keep_size for as long as Run is active, so a live Postgres
-// config reload (ALTER SYSTEM + pg_reload_conf) is noticed without waiting
-// for the next Bootstrap. It runs independently of the replication
-// connection's own reconnect cycle, using short-lived management
-// connections, and never fails Run - errors are logged and skipped.
+// monitorRetentionBudget runs for as long as Run is active. Every
+// RetentionCheckInterval it re-reads the server's max_slot_wal_keep_size, so
+// a live Postgres config reload (ALTER SYSTEM + pg_reload_conf) is noticed
+// without waiting for the next Bootstrap. Every RetentionSampleInterval it
+// samples the slot's retained WAL for the retention metrics. It runs
+// independently of the replication connection's own reconnect cycle, using
+// short-lived management connections, and never fails Run - errors are
+// logged and skipped.
 func (r *Reader) monitorRetentionBudget(ctx context.Context) {
-	ticker := time.NewTicker(r.config.RetentionCheckInterval)
-	defer ticker.Stop()
+	check := time.NewTicker(r.config.RetentionCheckInterval)
+	defer check.Stop()
+	sample := time.NewTicker(r.config.RetentionSampleInterval)
+	defer sample.Stop()
 
 	for {
+		var (
+			task func(context.Context, *pgx.Conn) error
+			name string
+		)
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			management, err := r.connectManagementWithTimeout(ctx)
-			if err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				r.log(ctx, slog.LevelWarn, "skipping periodic max_slot_wal_keep_size check: could not connect", "error", err)
-				continue
+		case <-check.C:
+			task, name = r.checkRetentionBudget, "max_slot_wal_keep_size check"
+		case <-sample.C:
+			task, name = r.sampleRetention, "retained WAL sample"
+		}
+		management, err := r.connectManagementWithTimeout(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
 			}
-			if err := r.checkRetentionBudget(ctx, management); err != nil {
-				r.log(ctx, slog.LevelWarn, "skipping periodic max_slot_wal_keep_size check", "error", err)
-			}
-			r.closeManagementConnection(management)
+			r.log(ctx, slog.LevelWarn, "skipping periodic "+name+": could not connect", "error", err)
+			continue
+		}
+		if err := task(ctx, management); err != nil && ctx.Err() == nil {
+			r.log(ctx, slog.LevelWarn, "skipping periodic "+name, "error", err)
+		}
+		r.closeManagementConnection(management)
+	}
+}
+
+// sampleRetention reads how much WAL PostgreSQL retains for the slot, how
+// much more it may write before invalidating the slot, and the effective
+// retention budget, for the retention metrics. Enforcing the budget is
+// #64's; this only measures.
+func (r *Reader) sampleRetention(ctx context.Context, management *pgx.Conn) error {
+	var (
+		retained, safe *int64
+		status         string
+	)
+	err := management.QueryRow(ctx, `
+		SELECT (CASE WHEN pg_is_in_recovery() THEN pg_last_wal_receive_lsn()
+		             ELSE pg_current_wal_lsn() END - restart_lsn)::bigint,
+		       COALESCE(wal_status, ''),
+		       safe_wal_size
+		FROM pg_replication_slots
+		WHERE slot_name = $1`, r.config.SlotName).Scan(&retained, &status, &safe)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrSlotNotFound
+	}
+	if err != nil {
+		return classifyPostgresError(err)
+	}
+	serverBytes, unbounded, err := readMaxSlotWALKeepSize(ctx, management)
+	if err != nil {
+		return err
+	}
+
+	metrics := r.metrics
+	metrics.retainedWAL.Store(valueOr(retained, -1))
+	metrics.safeWALSize.Store(valueOr(safe, -1))
+	metrics.walStatus.Store(-1)
+	for i, known := range walStatuses {
+		if status == known {
+			metrics.walStatus.Store(int32(i))
 		}
 	}
+	metrics.effectiveBudget.Store(effectiveRetentionBudget(r.config.MaxRetainedWALBytes, serverBytes, unbounded))
+	metrics.retentionKnown.Store(true)
+	return nil
+}
+
+func valueOr(value *int64, fallback int64) int64 {
+	if value == nil {
+		return fallback
+	}
+	return *value
 }
 
 // checkRetentionBudget reads the server's max_slot_wal_keep_size and warns

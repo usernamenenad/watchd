@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pglogrepl"
 )
@@ -49,6 +50,10 @@ type Change struct {
 type Transaction struct {
 	Cursor  Cursor
 	Changes []Change
+	// CommitTime is when the transaction committed, by PostgreSQL's clock.
+	// It is informational, for measuring latency: ordering always comes
+	// from Cursor.
+	CommitTime time.Time
 
 	// commitLSN is the start of the transaction's commit record, which is
 	// what PostgreSQL itself compares against a replication start position.
