@@ -74,6 +74,10 @@ type readerMetrics struct {
 	safeWALSize     atomic.Int64 // -1 when the server's retention is unbounded
 	walStatus       atomic.Int32 // index into walStatuses, -1 when unknown
 	effectiveBudget atomic.Int64
+	retentionState  atomic.Int32 // a retentionState; written only by the retention monitor
+
+	retentionTransitions metric.Int64Counter
+	retentionStateOpts   []metric.AddOption
 
 	reconnects     metric.Int64Counter
 	streamErrors   metric.Int64Counter
@@ -118,6 +122,7 @@ var errorClasses = []struct {
 	err   error
 	class string
 }{
+	{ErrRetainedWALBudgetExceeded, "retention_budget_exceeded"},
 	{ErrSlotInvalidated, "slot_invalidated"},
 	{ErrSlotInUse, "slot_in_use"},
 	{ErrSlotNotFound, "slot_not_found"},
@@ -238,6 +243,13 @@ func newReaderMetrics(meter metric.Meter, config ReaderConfig) (*readerMetrics, 
 		metric.WithExplicitBucketBoundaries(commitLatencyBounds...))
 	check(err)
 
+	m.retentionTransitions, err = meter.Int64Counter("watchd.cdc.retention.transitions", metric.WithUnit("{transition}"),
+		metric.WithDescription("Retention policy transitions, by the state entered."))
+	check(err)
+	for _, name := range retentionStateNames {
+		m.retentionStateOpts = append(m.retentionStateOpts, metric.WithAttributeSet(telemetry.Attributes(telemetry.KeyState.String(name))))
+	}
+
 	m.snapshotDuration, err = meter.Float64Histogram("watchd.cdc.snapshot.duration", metric.WithUnit("s"),
 		metric.WithDescription("Time to read one scope, by mode, for reads that succeed."),
 		metric.WithExplicitBucketBoundaries(snapshotBounds...))
@@ -287,7 +299,9 @@ func (m *readerMetrics) registerGauges(meter metric.Meter) error {
 		metric.WithDescription("1 for the slot's pg_replication_slots.wal_status, 0 for the others."))
 	budget, err10 := meter.Int64ObservableGauge("watchd.cdc.retention.budget", metric.WithUnit("By"),
 		metric.WithDescription("The effective retained-WAL budget: the stricter of MaxRetainedWALBytes and max_slot_wal_keep_size."))
-	if err := errors.Join(err1, err2, err3, err4, err5, err6, err7, err8, err9, err10); err != nil {
+	retentionState, err11 := meter.Int64ObservableGauge("watchd.cdc.retention.state",
+		metric.WithDescription("1 for the retention policy's current state (ok, warn, degrade, terminal), 0 for the others."))
+	if err := errors.Join(err1, err2, err3, err4, err5, err6, err7, err8, err9, err10, err11); err != nil {
 		return err
 	}
 
@@ -298,6 +312,11 @@ func (m *readerMetrics) registerGauges(meter metric.Meter) error {
 	walStatusOpts := make([]metric.ObserveOption, len(walStatuses))
 	for i, s := range walStatuses {
 		walStatusOpts[i] = metric.WithAttributeSet(telemetry.Attributes(telemetry.KeyState.String(s)))
+	}
+
+	retentionOpts := make([]metric.ObserveOption, len(retentionStateNames))
+	for i, name := range retentionStateNames {
+		retentionOpts[i] = metric.WithAttributeSet(telemetry.Attributes(telemetry.KeyState.String(name)))
 	}
 
 	_, err := meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
@@ -331,9 +350,13 @@ func (m *readerMetrics) registerGauges(meter metric.Meter) error {
 			for i, opt := range walStatusOpts {
 				o.ObserveInt64(walStatus, boolValue(int32(i) == status), opt)
 			}
+			policy := m.retentionState.Load()
+			for i, opt := range retentionOpts {
+				o.ObserveInt64(retentionState, boolValue(int32(i) == policy), opt)
+			}
 		}
 		return nil
-	}, state, received, acked, serverEnd, walLag, ackLag, retained, safe, walStatus, budget)
+	}, state, received, acked, serverEnd, walLag, ackLag, retained, safe, walStatus, budget, retentionState)
 	return err
 }
 

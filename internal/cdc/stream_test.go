@@ -37,28 +37,58 @@ func TestReaderRetryDelayIsBoundedAndJittered(t *testing.T) {
 	}
 }
 
-func TestReaderRepliesToRequestedKeepaliveWithSafeLSN(t *testing.T) {
+func keepaliveData(serverWALEnd uint64, replyRequested bool) []byte {
+	data := make([]byte, 18)
+	data[0] = pglogrepl.PrimaryKeepaliveMessageByteID
+	binary.BigEndian.PutUint64(data[1:9], serverWALEnd)
+	if replyRequested {
+		data[17] = 1
+	}
+	return data
+}
+
+// TestReaderAdvancesToKeepaliveBetweenTransactions: between transactions a
+// keepalive's position is safe to acknowledge, so an idle publication does
+// not pin WAL; inside one it is not, because that transaction is not yet
+// accepted.
+func TestReaderAdvancesToKeepaliveBetweenTransactions(t *testing.T) {
 	reader := newUnitReader(t)
 	var acknowledged pglogrepl.LSN
 	reader.sendStandbyStatus = func(_ context.Context, _ *pgconn.PgConn, lsn pglogrepl.LSN) error {
 		acknowledged = lsn
 		return nil
 	}
-
-	data := make([]byte, 18)
-	data[0] = pglogrepl.PrimaryKeepaliveMessageByteID
-	binary.BigEndian.PutUint64(data[1:9], uint64(42))
-	data[17] = 1 // ReplyRequested
+	ctx := context.Background()
+	decoder := NewDecoder()
 
 	safeLSN := pglogrepl.LSN(7)
-	if err := reader.consumeCopyData(context.Background(), nil, NewDecoder(), &safeLSN, data); err != nil {
+	if err := reader.consumeCopyData(ctx, nil, decoder, &safeLSN, keepaliveData(42, true)); err != nil {
 		t.Fatalf("consume keepalive: %v", err)
 	}
-	if acknowledged != safeLSN {
-		t.Fatalf("acknowledged LSN = %s, want safe LSN %s", acknowledged, safeLSN)
+	if safeLSN != 42 || acknowledged != 42 {
+		t.Fatalf("between transactions: safe LSN %s, acknowledged %s; want both 0/2A", safeLSN, acknowledged)
 	}
-	if reader.Stats().LastAcknowledgedLSN != safeLSN.String() {
-		t.Fatalf("stats = %#v, want acknowledged LSN %s", reader.Stats(), safeLSN)
+	if reader.Stats().LastAcknowledgedLSN != pglogrepl.LSN(42).String() {
+		t.Fatalf("stats = %#v, want acknowledged LSN 0/2A", reader.Stats())
+	}
+
+	// An older keepalive never moves it back.
+	if err := reader.consumeCopyData(ctx, nil, decoder, &safeLSN, keepaliveData(30, true)); err != nil {
+		t.Fatal(err)
+	}
+	if safeLSN != 42 {
+		t.Fatalf("an older keepalive moved the safe LSN to %s", safeLSN)
+	}
+
+	// Inside a transaction, the keepalive's position is not acknowledged.
+	if err := reader.consumeCopyData(ctx, nil, decoder, &safeLSN, xlogData(50, 50, beginPayload(90, time.Now(), 1))); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.consumeCopyData(ctx, nil, decoder, &safeLSN, keepaliveData(80, true)); err != nil {
+		t.Fatal(err)
+	}
+	if safeLSN != 42 || acknowledged != 42 {
+		t.Fatalf("inside a transaction: safe LSN %s, acknowledged %s; want both 0/2A", safeLSN, acknowledged)
 	}
 }
 

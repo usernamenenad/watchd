@@ -52,6 +52,9 @@ type Config struct {
 	// Ops configures the operational HTTP endpoint: metrics, health, and
 	// profiling. It is off unless Ops.ListenAddress is set.
 	Ops OpsConfig `json:"ops"`
+	// Retention configures the policy that bounds the WAL PostgreSQL retains
+	// for watchd's slot. Every field has a safe default.
+	Retention RetentionConfig `json:"retention"`
 
 	// DatabaseURL comes from WATCHD_DATABASE_URL, never from the file.
 	DatabaseURL string `json:"-"`
@@ -81,6 +84,22 @@ type OpsConfig struct {
 	// default, which leaves those profiles empty, and require Pprof.
 	MutexProfileFraction int `json:"mutex_profile_fraction"`
 	BlockProfileRate     int `json:"block_profile_rate"`
+}
+
+// RetentionConfig configures the retained-WAL policy. Thresholds are
+// fractions of the effective budget: the stricter of MaxRetainedWALBytes and
+// the server's max_slot_wal_keep_size. Past WarnFraction watchd logs a
+// warning; past DegradeFraction it logs an error; at the budget it drops its
+// slot and exits with code 3, and every client rebuilds on the next start.
+type RetentionConfig struct {
+	// MaxRetainedWALBytes is the budget. It defaults to 1 GiB.
+	MaxRetainedWALBytes int64 `json:"max_retained_wal_bytes"`
+	// WarnFraction and DegradeFraction default to 0.5 and 0.8, and must
+	// satisfy 0 < warn < degrade < 1.
+	WarnFraction    float64 `json:"warn_fraction"`
+	DegradeFraction float64 `json:"degrade_fraction"`
+	// SampleInterval is how often retained WAL is read. It defaults to 30s.
+	SampleInterval Duration `json:"sample_interval"`
 }
 
 // Duration is a time.Duration written as a Go duration string in JSON.
@@ -215,10 +234,14 @@ func (o OpsConfig) validate() error {
 
 func (c Config) readerConfig() cdc.ReaderConfig {
 	return cdc.ReaderConfig{
-		DatabaseURL:     c.DatabaseURL,
-		SourceID:        c.SourceID,
-		SlotName:        c.SlotName,
-		PublicationName: c.PublicationName,
+		DatabaseURL:              c.DatabaseURL,
+		SourceID:                 c.SourceID,
+		SlotName:                 c.SlotName,
+		PublicationName:          c.PublicationName,
+		MaxRetainedWALBytes:      c.Retention.MaxRetainedWALBytes,
+		RetentionWarnFraction:    c.Retention.WarnFraction,
+		RetentionDegradeFraction: c.Retention.DegradeFraction,
+		RetentionSampleInterval:  time.Duration(c.Retention.SampleInterval),
 	}
 }
 

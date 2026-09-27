@@ -115,11 +115,13 @@ These metrics come from `internal/cdc`. Every metric describes the process's one
 | `watchd.cdc.slot.retained_wal` | gauge | `By` | | WAL PostgreSQL retains for the slot: its current WAL position minus the slot's `restart_lsn`. |
 | `watchd.cdc.slot.safe_wal_size` | gauge | `By` | | WAL that can still be written before the slot is invalidated. Absent when the server's retention is unbounded. |
 | `watchd.cdc.slot.wal_status` | gauge | | `state` | 1 for the slot's `wal_status` (`reserved`, `extended`, `unreserved`, `lost`), 0 for the others. |
-| `watchd.cdc.retention.budget` | gauge | `By` | | The effective retained-WAL budget: the stricter of `MaxRetainedWALBytes` and `max_slot_wal_keep_size`. Enforcing it is #64. |
+| `watchd.cdc.retention.budget` | gauge | `By` | | The effective retained-WAL budget: the stricter of `MaxRetainedWALBytes` and `max_slot_wal_keep_size`. |
+| `watchd.cdc.retention.state` | gauge | | `state` | 1 for the retention policy's current state (`ok`, `warn`, `degrade`, `terminal`), 0 for the others. See [the retention policy](cdc-lifecycle.md#retention-policy). |
+| `watchd.cdc.retention.transitions` | counter | `{transition}` | `state` | Retention policy transitions, by the state entered. |
 
-The four slot and retention gauges are sampled from `pg_replication_slots` every 30 seconds while the stream runs, on a short-lived connection. They are absent until the first sample. `error_class` is one of:
+The slot and retention gauges are sampled from `pg_replication_slots` when the stream starts and then every 30 seconds, on a short-lived connection. They are absent until the first sample. `error_class` is one of:
 
-- `slot_invalidated`, `slot_in_use`, `slot_not_found`, `snapshot_window_closed`
+- `retention_budget_exceeded`, `slot_invalidated`, `slot_in_use`, `slot_not_found`, `snapshot_window_closed`
 - `insufficient_privileges`, `source_unavailable`, `replication_ended`, `sink_rejected`
 - `transaction_too_large`, `malformed_data`, `unsupported_change`
 - `invalid_config`, `postgres_server`, `timeout`, `other`

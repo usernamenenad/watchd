@@ -44,6 +44,21 @@ func withOps(ops string) string {
 	return strings.Replace(validConfig, `"source_id"`, `"ops": `+ops+`, "source_id"`, 1)
 }
 
+func withRetention(retention string) string {
+	return strings.Replace(validConfig, `"source_id"`, `"retention": `+retention+`, "source_id"`, 1)
+}
+
+func TestParseJSONConfigAcceptsRetentionConfig(t *testing.T) {
+	cfg, err := ParseJSONConfig(strings.NewReader(withRetention(`{"max_retained_wal_bytes": 1048576, "warn_fraction": 0.6, "degrade_fraction": 0.9, "sample_interval": "5s"}`)), secretURL)
+	if err != nil {
+		t.Fatalf("ParseJSONConfig: %v", err)
+	}
+	reader := cfg.readerConfig()
+	if reader.MaxRetainedWALBytes != 1<<20 || reader.RetentionWarnFraction != 0.6 || reader.RetentionDegradeFraction != 0.9 || reader.RetentionSampleInterval != 5*time.Second {
+		t.Fatalf("reader config = %+v", reader)
+	}
+}
+
 func TestParseJSONConfigAcceptsOpsConfig(t *testing.T) {
 	cfg, err := ParseJSONConfig(strings.NewReader(withOps(`{"listen_address": "127.0.0.1:9090", "pprof": true, "mutex_profile_fraction": 5, "block_profile_rate": 1000}`)), secretURL)
 	if err != nil {
@@ -85,6 +100,9 @@ func TestParseJSONConfigRejectsInvalidConfigWithoutLeakingTheURL(t *testing.T) {
 		"rate without pprof":   {config: withOps(`{"listen_address": ":9090", "block_profile_rate": 1}`), url: secretURL},
 		"pprof without listen": {config: withOps(`{"pprof": true}`), url: secretURL},
 		"unknown ops field":    {config: withOps(`{"listen_address": ":9090", "metrics": true}`), url: secretURL},
+		"inverted thresholds":  {config: withRetention(`{"warn_fraction": 0.9, "degrade_fraction": 0.5}`), url: secretURL},
+		"negative budget":      {config: withRetention(`{"max_retained_wal_bytes": -1}`), url: secretURL},
+		"negative interval":    {config: withRetention(`{"sample_interval": "-1s"}`), url: secretURL},
 		"no projections":       {config: `{"source_id": "local", "slot_name": "s", "publication_name": "p", "listen_address": ":1", "projections": {}}`, url: secretURL},
 	} {
 		_, err := ParseJSONConfig(strings.NewReader(test.config), test.url)

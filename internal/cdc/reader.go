@@ -25,6 +25,9 @@ type ReaderStats struct {
 	ReconnectAttempts    uint64
 	InFlightBytes        int
 	InFlightChanges      int
+	// RetentionState is the retention policy's state for the slot: "ok",
+	// "warn", "degrade", or "terminal". It is "ok" until the first sample.
+	RetentionState string
 }
 
 // Reader owns the lifecycle of one PostgreSQL logical replication source.
@@ -81,6 +84,7 @@ func NewReader(config ReaderConfig, sink TransactionSink) (*Reader, error) {
 		random:            rand.Float64,
 		stats: ReaderStats{
 			ConnectionState: stateIdle,
+			RetentionState:  retentionOK.String(),
 		},
 	}, nil
 }
@@ -99,6 +103,13 @@ func (r *Reader) setConnectionState(state string) {
 
 	r.stats.ConnectionState = state
 	r.metrics.setState(state)
+}
+
+func (r *Reader) setRetentionState(state retentionState) {
+	r.statsMu.Lock()
+	defer r.statsMu.Unlock()
+
+	r.stats.RetentionState = state.String()
 }
 
 func (r *Reader) setLastReceivedLSN(lsn pglogrepl.LSN) {
