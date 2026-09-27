@@ -15,10 +15,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/usernamenenad/watchd/internal/daemon"
+	"github.com/usernamenenad/watchd/internal/telemetry/telemetrytest"
 	"github.com/usernamenenad/watchd/sdk/go/watchd"
 )
 
@@ -87,8 +90,10 @@ func TestWatchdEndToEnd(t *testing.T) {
 		t.Fatal("watchd created a slot before any client asked for a scope")
 	}
 
-	// 1. Bootstrap: the first client creates the slot.
-	clientA := startClient(t, ctx, address, tenantA)
+	// 1. Bootstrap: the first client creates the slot. Its SDK metrics
+	// measure the whole path, from commit in PostgreSQL to apply.
+	clientMetrics := telemetrytest.New(t)
+	clientA := startClient(t, ctx, address, tenantA, clientMetrics.Meter())
 	clientA.waitFresh(t, ctx, app)
 	if !slotExists(t, ctx, app, slotName) {
 		t.Fatal("the first client's snapshot did not create the slot")
@@ -98,6 +103,11 @@ func TestWatchdEndToEnd(t *testing.T) {
 	setPermission(t, ctx, app, tenantA, 1, "owner")
 	deletePermission(t, ctx, app, tenantA, 2)
 	clientA.waitFresh(t, ctx, app)
+	projection := attribute.NewSet(attribute.String("projection", "tenant_permissions"))
+	if got := clientMetrics.HistogramCount(t, "watchd.sdk.commit_to_apply", projection); got == 0 {
+		t.Error("watchd.sdk.commit_to_apply was never recorded: batches lack commit_time")
+	}
+	clientMetrics.AssertAllowedAttributes(t)
 
 	// 2. Snapshot: a second scope joins the live stream.
 	clientB := startClient(t, ctx, address, tenantB)
@@ -208,7 +218,7 @@ type syncedClient struct {
 	changed chan struct{}
 }
 
-func startClient(t *testing.T, ctx context.Context, address, tenant string) *syncedClient {
+func startClient(t *testing.T, ctx context.Context, address, tenant string, meter ...metric.Meter) *syncedClient {
 	t.Helper()
 	client, err := watchd.Dial(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -225,6 +235,7 @@ func startClient(t *testing.T, ctx context.Context, address, tenant string) *syn
 			MinBackoff: 20 * time.Millisecond,
 			MaxBackoff: 200 * time.Millisecond,
 			OnState:    c.onState,
+			Meter:      firstMeter(meter),
 		})
 	}()
 	t.Cleanup(func() {
@@ -352,4 +363,11 @@ func readPermissions(t *testing.T, ctx context.Context, app *pgx.Conn, tenant st
 
 func stringsReader(text string) *strings.Reader {
 	return strings.NewReader(text)
+}
+
+func firstMeter(meters []metric.Meter) metric.Meter {
+	if len(meters) == 0 {
+		return nil
+	}
+	return meters[0]
 }

@@ -45,6 +45,28 @@ up. Receiving a change, or being connected, is not enough: after any
 disconnect or resync the projection is stale until the server confirms it
 again.
 
+## Metrics
+
+Pass an OpenTelemetry `metric.Meter` as `SyncConfig.Meter` to measure the
+sync. The SDK depends only on the OpenTelemetry metric API, so your
+application chooses the exporter:
+
+```go
+err = client.Sync(ctx, watchd.SyncConfig{
+    // ...
+    Meter: otel.GetMeterProvider().Meter("github.com/usernamenenad/watchd/sdk/go/watchd"),
+})
+```
+
+The most useful metric is `watchd.sdk.commit_to_apply`: the time from a
+transaction's commit in PostgreSQL until it was applied to your store,
+measured with each `Batch.CommitTime` (so it includes any clock skew between
+PostgreSQL and your host). The others cover apply and snapshot-install time,
+time to fresh after a connect or resync, how many syncs are running and how
+many are fresh, resyncs by reason, and stream errors. Metrics carry the
+projection name and never the scope. The full list is in
+[docs/observability.md](../../../docs/observability.md#go-sdk).
+
 ## Your own store
 
 `MemoryStore` suits caches and tests. To keep the projection in your own

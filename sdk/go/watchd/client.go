@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -88,6 +89,11 @@ type SyncConfig struct {
 	// failure. They default to 100ms and 5s.
 	MinBackoff time.Duration
 	MaxBackoff time.Duration
+	// Meter, if set, receives the sync's metrics: apply and snapshot-install
+	// durations, commit-to-apply latency, time to fresh, fresh and running
+	// syncs, resyncs, and stream errors. They carry the projection name,
+	// never the scope. See docs/observability.md in the watchd repository.
+	Meter metric.Meter
 }
 
 // Sync keeps cfg.Store in sync until ctx is cancelled, then returns nil.
@@ -109,7 +115,14 @@ func (c *Client) Sync(ctx context.Context, cfg SyncConfig) error {
 		cfg.MaxBackoff = max(defaultMaxBackoff, cfg.MinBackoff)
 	}
 
-	s := &syncer{client: c, cfg: cfg}
+	metrics, err := newSyncMetrics(cfg.Meter, cfg.Projection)
+	if err != nil {
+		return fmt.Errorf("watchd: create instruments: %w", err)
+	}
+	metrics.syncs.Add(ctx, 1, metrics.add)
+	defer metrics.syncs.Add(context.WithoutCancel(ctx), -1, metrics.add)
+
+	s := &syncer{client: c, cfg: cfg, metrics: metrics}
 	backoff := cfg.MinBackoff
 	snapshot := false // force a snapshot, ignoring the stored cursor
 	resyncs := 0      // resyncs since the last confirmed progress
@@ -118,6 +131,10 @@ func (c *Client) Sync(ctx context.Context, cfg SyncConfig) error {
 		s.setState(false, s.state.Cursor)
 		if ctx.Err() != nil {
 			return nil
+		}
+
+		if err != nil && !errors.Is(err, errResync) && !errors.Is(err, errStore) {
+			metrics.streamError(ctx, err)
 		}
 
 		retryNow := false
@@ -179,6 +196,7 @@ func isPermanent(err error) bool {
 type syncer struct {
 	client     *Client
 	cfg        SyncConfig
+	metrics    *syncMetrics
 	state      State
 	reported   bool
 	progressed bool
@@ -197,6 +215,8 @@ func (s *syncer) stream(ctx context.Context, snapshot bool) error {
 		cursor = stored
 	}
 
+	opened := time.Now()
+	var snapshotStarted time.Time
 	streamCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream, err := s.client.api.Watch(streamCtx, &watchv1.WatchRequest{
@@ -227,6 +247,7 @@ func (s *syncer) stream(ctx context.Context, snapshot bool) error {
 		switch event := response.GetEvent().(type) {
 		case *watchv1.WatchResponse_SnapshotBegin:
 			s.setState(false, "")
+			snapshotStarted = time.Now()
 			if writer, err = s.cfg.Store.BeginSnapshot(ctx); err != nil {
 				writer = nil
 				return fmt.Errorf("%w: begin snapshot: %w", errStore, err)
@@ -253,13 +274,20 @@ func (s *syncer) stream(ctx context.Context, snapshot bool) error {
 			if err != nil {
 				return fmt.Errorf("%w: commit snapshot: %w", errStore, err)
 			}
+			s.metrics.install.Record(ctx, secondsSince(snapshotStarted), s.metrics.record)
 
 		case *watchv1.WatchResponse_Batch:
 			if writer != nil {
 				return errors.New("watchd: batch inside a snapshot")
 			}
-			if err := s.cfg.Store.Apply(ctx, convertBatch(event.Batch)); err != nil {
+			batch := convertBatch(event.Batch)
+			started := time.Now()
+			if err := s.cfg.Store.Apply(ctx, batch); err != nil {
 				return fmt.Errorf("%w: apply batch: %w", errStore, err)
+			}
+			s.metrics.apply.Record(ctx, secondsSince(started), s.metrics.record)
+			if !batch.CommitTime.IsZero() {
+				s.metrics.commitToApply.Record(ctx, secondsSince(batch.CommitTime), s.metrics.record)
 			}
 
 		case *watchv1.WatchResponse_Progress:
@@ -270,10 +298,14 @@ func (s *syncer) stream(ctx context.Context, snapshot bool) error {
 			if err := s.cfg.Store.SaveCursor(ctx, cursor); err != nil {
 				return fmt.Errorf("%w: save cursor: %w", errStore, err)
 			}
+			if !s.progressed {
+				s.metrics.timeToFresh.Record(ctx, secondsSince(opened), s.metrics.record)
+			}
 			s.progressed = true
 			s.setState(true, cursor)
 
 		case *watchv1.WatchResponse_Resync:
+			s.metrics.resync(ctx, event.Resync.GetReason())
 			return errResync
 
 		default:
@@ -287,6 +319,14 @@ func (s *syncer) setState(fresh bool, cursor string) {
 	next := State{Fresh: fresh, Cursor: cursor}
 	if s.reported && next == s.state {
 		return
+	}
+	if wasFresh := s.reported && s.state.Fresh; wasFresh != fresh {
+		delta := int64(1)
+		if !fresh {
+			delta = -1
+		}
+		// A sync going stale because ctx ended must still be counted.
+		s.metrics.fresh.Add(context.Background(), delta, s.metrics.add)
 	}
 	s.state, s.reported = next, true
 	if s.cfg.OnState != nil {
@@ -304,7 +344,11 @@ func convertBatch(batch *watchv1.Batch) Batch {
 			Values:    convertValues(change.GetValues()),
 		}
 	}
-	return Batch{Cursor: batch.GetCursor(), Changes: changes}
+	converted := Batch{Cursor: batch.GetCursor(), Changes: changes}
+	if batch.GetCommitTime() != nil {
+		converted.CommitTime = batch.GetCommitTime().AsTime()
+	}
+	return converted
 }
 
 var operations = map[watchv1.Operation]Operation{

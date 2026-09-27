@@ -165,6 +165,33 @@ These metrics come from `internal/watch`. Per-watcher values are histograms samp
 
 Every `Batch` on the wire also carries `commit_time`, so clients can measure commit to apply themselves.
 
+### Go SDK
+
+These metrics come from `sdk/go/watchd`, recorded in the client application through the meter it passes as `SyncConfig.Meter`. They carry the `projection` name and never the scope, so several syncs of one projection share their series.
+
+| Metric | Type | Unit | Attributes | Meaning |
+| --- | --- | --- | --- | --- |
+| `watchd.sdk.commit_to_apply` | histogram | `s` | `projection` | From commit in PostgreSQL to the batch applied to the store: the end-to-end latency. Subject to clock skew between PostgreSQL and the client. |
+| `watchd.sdk.apply.duration` | histogram | `s` | `projection` | Time `Store.Apply` took for one batch. |
+| `watchd.sdk.snapshot.install.duration` | histogram | `s` | `projection` | From `SnapshotBegin` to the snapshot committed to the store. |
+| `watchd.sdk.time_to_fresh` | histogram | `s` | `projection` | From opening a stream, after a start, reconnect, or resync, to the first `Progress`. |
+| `watchd.sdk.syncs` | up-down counter | `{sync}` | `projection` | `Sync` calls running. |
+| `watchd.sdk.fresh` | up-down counter | `{sync}` | `projection` | `Sync` calls whose projection is fresh. `syncs − fresh` are stale. |
+| `watchd.sdk.resyncs` | counter | `{event}` | `projection`, `reason` | Resyncs the server asked for. |
+| `watchd.sdk.stream.errors` | counter | `{error}` | `projection`, `error_class` | Streams that ended in an error. `error_class` is the lowercase gRPC status code, such as `unavailable`. |
+
+## Where time goes
+
+Read the stages in order to locate latency or a bottleneck:
+
+1. **PostgreSQL → watchd**: `watchd.cdc.wal_lag` and `watchd.cdc.transaction.duration`.
+2. **Accepting into the hub**: `watchd.cdc.sink.duration`, split into `watchd.hub.lock.wait` and fan-out work in `watchd.hub.accept.duration`. Replication waits on this.
+3. **Hub → stream**: `watchd.hub.watcher.queue_depth` and `watchd.hub.watcher.lag`.
+4. **Stream → client**: `watchd.server.send.duration`. Long sends mean a slow reader.
+5. **Client apply**: `watchd.sdk.apply.duration`.
+
+End to end, the latency is `watchd.cdc.commit_to_accept`, then `watchd.server.batch.commit_to_send`, then `watchd.sdk.commit_to_apply`. For CPU, allocation, and lock contention, profile through `/debug/pprof` (see [Ops endpoint](#ops-endpoint)). Hot paths found while instrumenting are tracked in #68, #69, and #70.
+
 ## Overhead
 
 Instrumentation adds no allocations on the hot path: each instrument and attribute set is created once, and counts are added once per transaction, not once per change. `BenchmarkConsumeTransaction` in `internal/cdc` measures the reader's per-transaction path (14 pgoutput messages: relation, BEGIN, 10 inserts, COMMIT; decode, sink, acknowledge):
@@ -186,4 +213,4 @@ The instrumented path costs about 2µs per transaction, mostly histogram recordi
 
 The instruments cost a constant ~170ns per transaction: two histogram records and three clock reads. Routing itself is linear in watchers, because every watcher's scope is checked against every transaction. That is the first hot path to optimize under #57.
 
-The SDK instruments are added by #56.
+The SDK instruments add two histogram records and two clock reads per batch applied.
