@@ -54,5 +54,12 @@ SDK configures this.
 | `UNAVAILABLE` | The source cannot be read right now; retry |
 | `INTERNAL` | Anything else; details are logged server-side only |
 
+## Dependencies
+
+watchd pins `google.golang.org/grpc` to a development build
+(`v1.85.0-dev.0.20260825072537-93e31b48545e`) because v1.84.0, the latest
+release, has GO-2026-6443: a request without an authority or `Host` header
+crashes the server. Move to v1.85.0 once it is released.
+
 The server also implements the standard `grpc.health.v1.Health` service,
 reporting `SERVING` only while its source can serve this contract.

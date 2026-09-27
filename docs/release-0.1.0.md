@@ -12,10 +12,16 @@ It is explicitly not a scale or high-availability release. 0.1.0 is single-proce
 
 | Area | State |
 | --- | --- |
-| `internal/cdc` | Implemented: replication connection, `pgoutput` decoder, resilient reader with retry and error classification, gap-free bootstrap, scoped snapshot, slot validation |
+| `internal/cdc` | Implemented: replication connection, `pgoutput` decoder, resilient reader with retry and error classification, gap-free bootstrap and scoped snapshots with a visibility-based boundary, `Source` lifecycle, WAL retention checks |
+| `internal/watch` | Implemented: hub with bounded replay, scope routing, progress, and resync (#3, first slice) |
+| `api/watch/v1`, `internal/server` | Implemented: v1 gRPC Watch contract, server, health service (#4, without authentication) |
+| `sdk/go/watchd` | Implemented: `Sync`, `Store`, `MemoryStore`, fresh/stale state (#4) |
+| `cmd/watchd`, `internal/daemon` | Implemented: JSON configuration, startup and shutdown ordering, exit codes (#29, first slice) |
+| `examples/postgres` | Runnable quickstart (#35, first slice) |
+| `tests/integration` | End-to-end test of process and SDK against PostgreSQL |
 | `docs/` | v0 contract, architecture tour, CDC lifecycle, roadmap |
-| `internal/watch`, `internal/server`, `api/watch/v1`, `sdk/go/watchd`, `cmd/watchd`, `cmd/watchctl`, `tests/`, `examples/`, `deploy/` | Placeholder READMEs only |
-| CI | Commit-policy workflow only; `make build` and `make fmt` are stubs |
+| `cmd/watchctl`, `deploy/` | Placeholder READMEs only |
+| CI | Format, vet, unit and integration tests, vulnerability scan, commit policy |
 
 Closed on the way here: #1 resilient reader, #2 gap-free snapshot handoff, #19 scoped snapshot at an arbitrary LSN, #10 community files, #26 module path.
 

@@ -1,7 +1,7 @@
 .PHONY: build proto test integration fmt fmt-check vet vulncheck commit-policy postgres-up postgres-down postgres-logs
 
 build:
-	@echo "watchd skeleton: no build targets implemented"
+	go build -o bin/watchd ./cmd/watchd
 
 # Regenerates the committed Go code for the v1 API. Requires protoc,
 # protoc-gen-go, and protoc-gen-go-grpc on PATH.

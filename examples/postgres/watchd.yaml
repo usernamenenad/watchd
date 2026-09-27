@@ -1,0 +1,11 @@
+# The same configuration as watchd.json, in YAML.
+source_id: local
+slot_name: watchd_example
+publication_name: watchd_publication
+listen_address: 127.0.0.1:7070
+projections:
+  tenant_permissions:
+    schema: public
+    table: tenant_permissions_projection
+    scope_column: tenant_id
+    primary_key: [tenant_id, user_id]

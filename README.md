@@ -16,7 +16,7 @@ The initial version will run as a normal service deployed alongside applications
 
 ## Status
 
-`watchd` is pre-alpha. The v0 contract, local PostgreSQL logical-replication environment, resilient transaction reader, and gap-free bootstrap handoff are in place. Bootstrap creates a new persistent slot with an exported PostgreSQL snapshot, reads a validated projection scope at that snapshot, and returns the matching cursor; the reader then emits only committed transaction batches, acknowledges only locally accepted batches, and reconnects after transient connection loss without recreating a missing slot. The watch runtime, network API, SDK, and production release are not implemented. APIs and configuration may change without compatibility guarantees.
+`watchd` is pre-alpha, and runs end to end: the `watchd` process streams one PostgreSQL source, serves the v1 gRPC Watch API, and the Go SDK keeps a client's projection in sync with explicit fresh/stale state, rebuilding after a restart or resync. Try it with [the quickstart](examples/postgres/README.md). Authentication, metrics, full configuration, and a production release are not implemented yet. APIs and configuration may change without compatibility guarantees.
 
 ## Local development
 
