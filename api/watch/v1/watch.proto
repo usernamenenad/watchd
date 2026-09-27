@@ -1,0 +1,159 @@
+// Watch API v1: keep a local projection of one PostgreSQL scope in sync,
+// and know when it is fresh. See docs/semantics.md for the contract these
+// messages carry.
+syntax = "proto3";
+
+package watch.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/usernamenenad/watchd/api/watch/v1;watchv1";
+
+service WatchService {
+  // Watch streams one scope of one projection.
+  //
+  // Without a resume cursor, the stream starts with a snapshot:
+  // SnapshotBegin, SnapshotRows..., SnapshotEnd, then live events. With a
+  // cursor from an earlier Batch or Progress, it replays what the client
+  // missed and continues live, if the server can still replay from there.
+  // Live events are Batch and Progress, in source commit order.
+  //
+  // A Resync event ends the stream: the client marks its projection stale
+  // and calls Watch again without a cursor.
+  //
+  // Errors: NOT_FOUND for an unknown projection, INVALID_ARGUMENT for a
+  // malformed cursor or one from another source, UNAVAILABLE when the
+  // source cannot be read.
+  rpc Watch(WatchRequest) returns (stream WatchResponse);
+
+  // CompareCursors orders two cursors of this server's source, so clients
+  // never decode a cursor to compare positions. Cursors from different
+  // sources are not comparable: INVALID_ARGUMENT.
+  rpc CompareCursors(CompareCursorsRequest) returns (CompareCursorsResponse);
+}
+
+message WatchRequest {
+  // projection names a projection configured on the server.
+  string projection = 1;
+  // scope is the scope column's value in PostgreSQL text form, for example a
+  // tenant ID. A uuid must use its canonical lowercase form.
+  string scope = 2;
+  // resume_cursor is a cursor from an earlier Batch or Progress, or empty to
+  // start with a snapshot.
+  string resume_cursor = 3;
+}
+
+message WatchResponse {
+  oneof event {
+    SnapshotBegin snapshot_begin = 1;
+    SnapshotRows snapshot_rows = 2;
+    SnapshotEnd snapshot_end = 3;
+    Batch batch = 4;
+    Progress progress = 5;
+    Resync resync = 6;
+  }
+}
+
+// SnapshotBegin starts a snapshot. The projection is stale until the
+// Progress that follows SnapshotEnd.
+message SnapshotBegin {}
+
+// SnapshotRows carries some of the scope's rows, in primary-key order.
+message SnapshotRows {
+  repeated Row rows = 1;
+}
+
+// SnapshotEnd ends a snapshot: the rows received since SnapshotBegin now
+// replace the client's projection, in one step.
+message SnapshotEnd {}
+
+// Batch is the part of one committed source transaction that belongs to
+// this projection and scope. Apply it whole. Batches can be delivered more
+// than once, so applying one must be idempotent.
+message Batch {
+  // cursor is the position just after the transaction. After applying the
+  // batch, the client may persist it and resume from it.
+  string cursor = 1;
+  repeated Change changes = 2;
+}
+
+// Progress states that every relevant committed change through cursor has
+// been delivered. After applying everything before it, the client is fresh
+// as of cursor, and may persist it and resume from it.
+message Progress {
+  string cursor = 1;
+}
+
+// Resync ends the stream: the client cannot continue from where it is.
+message Resync {
+  ResyncReason reason = 1;
+}
+
+enum ResyncReason {
+  RESYNC_REASON_UNSPECIFIED = 0;
+  // The resume cursor is not replayable here, for example after a server
+  // restart or once the replay window moved past it.
+  RESYNC_REASON_CURSOR_UNAVAILABLE = 1;
+  // The client fell further behind than the server buffers for it.
+  RESYNC_REASON_SLOW_WATCHER = 2;
+  // The snapshot could not be paired with the change stream; a new one will.
+  RESYNC_REASON_SNAPSHOT_WINDOW_CLOSED = 3;
+  // The server's source stream ended.
+  RESYNC_REASON_SOURCE_STOPPED = 4;
+}
+
+message Row {
+  // values maps each column to its value.
+  map<string, Value> values = 1;
+}
+
+message Change {
+  Operation operation = 1;
+  // table is the schema-qualified source table.
+  string table = 2;
+  // key identifies the row: its primary-key columns, in PostgreSQL text
+  // form. A key value is never NULL.
+  map<string, string> key = 3;
+  // values is the row's new state for an insert or update, and empty for a
+  // delete.
+  map<string, Value> values = 4;
+}
+
+enum Operation {
+  OPERATION_UNSPECIFIED = 0;
+  OPERATION_INSERT = 1;
+  OPERATION_UPDATE = 2;
+  OPERATION_DELETE = 3;
+}
+
+// Value is one column value. See "Value encoding" in docs/semantics.md.
+message Value {
+  oneof kind {
+    // text is the value's PostgreSQL text representation, for every type.
+    string text = 1;
+    // null is SQL NULL.
+    google.protobuf.NullValue null = 2;
+    // unchanged_toast marks a large column an UPDATE left unchanged and did
+    // not resend: keep the value the client already has.
+    google.protobuf.Empty unchanged_toast = 3;
+  }
+}
+
+message CompareCursorsRequest {
+  string left = 1;
+  string right = 2;
+}
+
+message CompareCursorsResponse {
+  CursorOrder order = 1;
+}
+
+enum CursorOrder {
+  CURSOR_ORDER_UNSPECIFIED = 0;
+  // left is before right.
+  CURSOR_ORDER_BEFORE = 1;
+  CURSOR_ORDER_EQUAL = 2;
+  // left is after right.
+  CURSOR_ORDER_AFTER = 3;
+}
