@@ -49,6 +49,9 @@ type Config struct {
 	// ShutdownTimeout bounds a graceful shutdown, as a Go duration such as
 	// "10s". It defaults to 10s.
 	ShutdownTimeout Duration `json:"shutdown_timeout,omitempty"`
+	// Ops configures the operational HTTP endpoint: metrics, health, and
+	// profiling. It is off unless Ops.ListenAddress is set.
+	Ops OpsConfig `json:"ops"`
 
 	// DatabaseURL comes from WATCHD_DATABASE_URL, never from the file.
 	DatabaseURL string `json:"-"`
@@ -60,6 +63,24 @@ type ProjectionConfig struct {
 	Table       string   `json:"table"`
 	ScopeColumn string   `json:"scope_column"`
 	PrimaryKey  []string `json:"primary_key"`
+}
+
+// OpsConfig configures the operational HTTP endpoint, served on its own
+// listener so it never shares a port, or a failure, with the API.
+type OpsConfig struct {
+	// ListenAddress is where /metrics, /healthz, /readyz, and, when enabled,
+	// /debug/pprof/* are served, for example "127.0.0.1:9090". Empty
+	// disables the endpoint.
+	ListenAddress string `json:"listen_address"`
+	// Pprof exposes /debug/pprof/*. It reveals stack traces and internals,
+	// so it is off unless enabled.
+	Pprof bool `json:"pprof"`
+	// MutexProfileFraction samples 1 in n mutex contention events for the
+	// mutex profile; BlockProfileRate samples blocking events lasting n
+	// nanoseconds or more for the block profile. Both are 0 (off) by
+	// default, which leaves those profiles empty, and require Pprof.
+	MutexProfileFraction int `json:"mutex_profile_fraction"`
+	BlockProfileRate     int `json:"block_profile_rate"`
 }
 
 // Duration is a time.Duration written as a Go duration string in JSON.
@@ -162,6 +183,9 @@ func (c Config) validate() error {
 	case c.ShutdownTimeout < 0:
 		return fmt.Errorf("%w: shutdown_timeout must not be negative", ErrInvalidConfig)
 	}
+	if err := c.Ops.validate(); err != nil {
+		return err
+	}
 	if _, err := cdc.NewReader(c.readerConfig(), func(context.Context, cdc.Transaction) error { return nil }); err != nil {
 		// cdc's configuration errors never include the URL.
 		return fmt.Errorf("%w: source: %v", ErrInvalidConfig, err)
@@ -173,6 +197,18 @@ func (c Config) validate() error {
 	}
 	if _, err := server.New(server.Config{SourceID: c.SourceID}, noWatcher{}); err != nil {
 		return fmt.Errorf("%w: source_id: %v", ErrInvalidConfig, err)
+	}
+	return nil
+}
+
+func (o OpsConfig) validate() error {
+	switch {
+	case o.MutexProfileFraction < 0 || o.BlockProfileRate < 0:
+		return fmt.Errorf("%w: ops profile rates must not be negative", ErrInvalidConfig)
+	case (o.MutexProfileFraction > 0 || o.BlockProfileRate > 0) && !o.Pprof:
+		return fmt.Errorf("%w: ops.mutex_profile_fraction and ops.block_profile_rate require ops.pprof", ErrInvalidConfig)
+	case o.Pprof && o.ListenAddress == "":
+		return fmt.Errorf("%w: ops.pprof requires ops.listen_address", ErrInvalidConfig)
 	}
 	return nil
 }

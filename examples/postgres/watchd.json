@@ -3,6 +3,9 @@
   "slot_name": "watchd_example",
   "publication_name": "watchd_publication",
   "listen_address": "127.0.0.1:7070",
+  "ops": {
+    "listen_address": "127.0.0.1:9090"
+  },
   "projections": {
     "tenant_permissions": {
       "schema": "public",

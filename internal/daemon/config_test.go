@@ -40,6 +40,21 @@ func TestParseJSONConfigAcceptsValidConfig(t *testing.T) {
 	}
 }
 
+func withOps(ops string) string {
+	return strings.Replace(validConfig, `"source_id"`, `"ops": `+ops+`, "source_id"`, 1)
+}
+
+func TestParseJSONConfigAcceptsOpsConfig(t *testing.T) {
+	cfg, err := ParseJSONConfig(strings.NewReader(withOps(`{"listen_address": "127.0.0.1:9090", "pprof": true, "mutex_profile_fraction": 5, "block_profile_rate": 1000}`)), secretURL)
+	if err != nil {
+		t.Fatalf("ParseJSONConfig: %v", err)
+	}
+	want := OpsConfig{ListenAddress: "127.0.0.1:9090", Pprof: true, MutexProfileFraction: 5, BlockProfileRate: 1000}
+	if cfg.Ops != want {
+		t.Fatalf("ops = %+v, want %+v", cfg.Ops, want)
+	}
+}
+
 // TestExampleConfigIsValid keeps the shipped example loadable.
 func TestExampleConfigIsValid(t *testing.T) {
 	file, err := os.Open("../../examples/postgres/watchd.json")
@@ -66,6 +81,10 @@ func TestParseJSONConfigRejectsInvalidConfigWithoutLeakingTheURL(t *testing.T) {
 		"no listen address":    {config: strings.Replace(validConfig, "127.0.0.1:7070", "", 1), url: secretURL},
 		"separator in source":  {config: strings.Replace(validConfig, `"source_id": "local"`, `"source_id": "a@b"`, 1), url: secretURL},
 		"bad duration":         {config: strings.Replace(validConfig, `"source_id"`, `"shutdown_timeout": "soon", "source_id"`, 1), url: secretURL},
+		"negative mutex rate":  {config: withOps(`{"listen_address": ":9090", "pprof": true, "mutex_profile_fraction": -1}`), url: secretURL},
+		"rate without pprof":   {config: withOps(`{"listen_address": ":9090", "block_profile_rate": 1}`), url: secretURL},
+		"pprof without listen": {config: withOps(`{"pprof": true}`), url: secretURL},
+		"unknown ops field":    {config: withOps(`{"listen_address": ":9090", "metrics": true}`), url: secretURL},
 		"no projections":       {config: `{"source_id": "local", "slot_name": "s", "publication_name": "p", "listen_address": ":1", "projections": {}}`, url: secretURL},
 	} {
 		_, err := ParseJSONConfig(strings.NewReader(test.config), test.url)

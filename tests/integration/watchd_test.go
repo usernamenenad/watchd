@@ -5,8 +5,10 @@ package integration
 import (
 	"context"
 	"fmt"
+	"io"
 	"maps"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -80,7 +82,7 @@ func TestWatchdEndToEnd(t *testing.T) {
 	address := probe.Addr().String()
 	_ = probe.Close()
 
-	stopFirst := startWatchd(t, ctx, cfg, address)
+	stopFirst, opsURL := startWatchd(t, ctx, cfg, address)
 	if slotExists(t, ctx, app, slotName) {
 		t.Fatal("watchd created a slot before any client asked for a scope")
 	}
@@ -91,6 +93,7 @@ func TestWatchdEndToEnd(t *testing.T) {
 	if !slotExists(t, ctx, app, slotName) {
 		t.Fatal("the first client's snapshot did not create the slot")
 	}
+	checkOps(t, opsURL)
 	setPermission(t, ctx, app, tenantA, 3, "admin")
 	setPermission(t, ctx, app, tenantA, 1, "owner")
 	deletePermission(t, ctx, app, tenantA, 2)
@@ -107,7 +110,7 @@ func TestWatchdEndToEnd(t *testing.T) {
 	stopFirst()
 	clientA.waitStale(t, ctx)
 	setPermission(t, ctx, app, tenantA, 4, "written-while-down")
-	stopSecond := startWatchd(t, ctx, cfg, address)
+	stopSecond, _ := startWatchd(t, ctx, cfg, address)
 	defer stopSecond()
 	clientA.waitFresh(t, ctx, app)
 	clientB.waitFresh(t, ctx, app)
@@ -118,15 +121,24 @@ func TestWatchdEndToEnd(t *testing.T) {
 	clientA.waitFresh(t, ctx, app)
 }
 
-func startWatchd(t *testing.T, ctx context.Context, cfg daemon.Config, address string) func() {
+// startWatchd serves watchd on address, and its ops endpoint on a free
+// port whose base URL it returns.
+func startWatchd(t *testing.T, ctx context.Context, cfg daemon.Config, address string) (func(), string) {
 	t.Helper()
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	opsListener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen ops: %v", err)
+	}
+	opsURL := "http://" + opsListener.Addr().String()
 	serveCtx, stop := context.WithCancel(ctx)
 	done := make(chan error, 1)
-	go func() { done <- daemon.Serve(serveCtx, cfg, listener, nil) }()
+	go func() {
+		done <- daemon.Serve(serveCtx, cfg, daemon.Listeners{API: listener, Ops: opsListener}, nil)
+	}()
 	stopped := false
 	return func() {
 		t.Helper()
@@ -143,6 +155,40 @@ func startWatchd(t *testing.T, ctx context.Context, cfg daemon.Config, address s
 		case <-time.After(10 * time.Second):
 			t.Fatal("watchd did not shut down")
 		}
+	}, opsURL
+}
+
+// checkOps asserts a serving watchd's ops endpoint: ready, with runtime and
+// watchd metrics, and without pprof unless it is enabled.
+func checkOps(t *testing.T, opsURL string) {
+	t.Helper()
+	get := func(path string) (int, string) {
+		response, err := http.Get(opsURL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		return response.StatusCode, string(body)
+	}
+	if code, _ := get("/readyz"); code != http.StatusOK {
+		t.Errorf("/readyz = %d while serving", code)
+	}
+	code, metrics := get("/metrics")
+	if code != http.StatusOK {
+		t.Fatalf("/metrics = %d", code)
+	}
+	for _, want := range []string{"watchd_serving 1", "go_goroutine_count", `watchd_source_id="e2e"`} {
+		if !strings.Contains(metrics, want) {
+			t.Errorf("/metrics does not contain %q", want)
+		}
+	}
+	// Neither the source password nor any scope value is ever exported.
+	if strings.Contains(metrics, "watchd_replicator@") || strings.Contains(metrics, "00000000-0000-0000-0000-0000000000e") {
+		t.Error("/metrics exposes a credential or a scope")
+	}
+	if code, _ := get("/debug/pprof/"); code != http.StatusNotFound {
+		t.Errorf("/debug/pprof/ = %d with pprof off, want 404", code)
 	}
 }
 
