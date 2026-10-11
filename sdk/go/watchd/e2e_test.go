@@ -93,11 +93,13 @@ func TestSyncAgainstRealServerAndHub(t *testing.T) {
 	// reaches this client.
 	transaction := cdc.NewTransactionForTest(e2eSource, 200, 210, 20,
 		cdc.Change{Operation: cdc.OperationInsert, Table: "public.permissions",
-			Key:    map[string]string{"tenant_id": "t1", "user_id": "u2"},
-			Values: map[string]any{"tenant_id": "t1", "user_id": "u2", "role": "viewer"}},
+			Key:     map[string]string{"tenant_id": "t1", "user_id": "u2"},
+			Columns: []string{"tenant_id", "user_id", "role"},
+			Values:  []cdc.Value{cdc.TextValue("t1"), cdc.TextValue("u2"), cdc.TextValue("viewer")}},
 		cdc.Change{Operation: cdc.OperationInsert, Table: "public.permissions",
-			Key:    map[string]string{"tenant_id": "t2", "user_id": "u9"},
-			Values: map[string]any{"tenant_id": "t2", "user_id": "u9", "role": "viewer"}},
+			Key:     map[string]string{"tenant_id": "t2", "user_id": "u9"},
+			Columns: []string{"tenant_id", "user_id", "role"},
+			Values:  []cdc.Value{cdc.TextValue("t2"), cdc.TextValue("u9"), cdc.TextValue("viewer")}},
 	)
 	if err := hub.Accept(ctx, transaction); err != nil {
 		t.Fatalf("Accept: %v", err)

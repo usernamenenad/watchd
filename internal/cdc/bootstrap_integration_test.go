@@ -330,9 +330,10 @@ func applyBootstrapTransaction(t *testing.T, state bootstrapProjection, transact
 		case OperationDelete:
 			delete(state, userID)
 		case OperationInsert, OperationUpdate:
+			row := changeRow(t, change)
 			state[userID] = bootstrapProjectionRow{
-				permissions: bootstrapString(t, change.Values["permissions"]),
-				version:     bootstrapString(t, change.Values["version"]),
+				permissions: bootstrapString(t, row["permissions"]),
+				version:     bootstrapString(t, row["version"]),
 			}
 		default:
 			t.Fatalf("unknown projection operation %q", change.Operation)

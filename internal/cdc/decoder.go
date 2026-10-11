@@ -3,7 +3,7 @@ package cdc
 import (
 	"errors"
 	"fmt"
-	"maps"
+	"strings"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -46,20 +46,53 @@ const (
 	defaultMaxTransactionBytes   = 16 << 20
 	defaultMaxTransactionChanges = 100_000
 	defaultMaxValueBytes         = 1 << 20
+
+	// maxPendingCapacityHint caps how many changes BEGIN preallocates from the
+	// previous transaction's size, so one large transaction does not make
+	// every later one reserve a large slice.
+	maxPendingCapacityHint = 1024
 )
 
 // Decoder translates pgoutput protocol messages into committed transactions.
 // It is intentionally stateful: PostgreSQL identifies tables by relation ID and
 // can send many row changes before the COMMIT that makes them visible.
 type Decoder struct {
-	relations             map[uint32]*pglogrepl.RelationMessage
+	relations             map[uint32]*relationInfo
 	pending               []Change
 	pendingXid            uint32
 	pendingCommitTime     time.Time
 	pendingBytes          int
+	pendingCapacityHint   int
 	maxTransactionBytes   int
 	maxTransactionChanges int
 	maxValueBytes         int
+}
+
+// relationInfo is what row decoding needs from a RelationMessage, derived
+// once when the message arrives rather than for every row change.
+type relationInfo struct {
+	table string
+	// columns are the relation's column names in tuple order. Every Change
+	// of the relation shares this slice, so it is never modified: a new
+	// RelationMessage replaces the whole relationInfo.
+	columns []string
+	// keyIndexes are the positions of the replica-identity columns.
+	keyIndexes []int
+}
+
+func newRelationInfo(relation *pglogrepl.RelationMessage) *relationInfo {
+	info := &relationInfo{
+		table:   qualifiedTable(relation.Namespace, relation.RelationName),
+		columns: make([]string, len(relation.Columns)),
+	}
+	for index, column := range relation.Columns {
+		info.columns[index] = column.Name
+		if column.Flags == 1 {
+			info.keyIndexes = append(info.keyIndexes, index)
+		}
+	}
+
+	return info
 }
 
 // NewDecoder returns a Decoder with no registered relations or pending changes.
@@ -84,7 +117,7 @@ func NewDecoderWithLimits(maxTransactionBytes, maxTransactionChanges, maxValueBy
 	}
 
 	return &Decoder{
-		relations:             make(map[uint32]*pglogrepl.RelationMessage),
+		relations:             make(map[uint32]*relationInfo),
 		maxTransactionBytes:   maxTransactionBytes,
 		maxTransactionChanges: maxTransactionChanges,
 		maxValueBytes:         maxValueBytes,
@@ -96,14 +129,16 @@ func NewDecoderWithLimits(maxTransactionBytes, maxTransactionChanges, maxValueBy
 func (d *Decoder) Consume(message pglogrepl.Message) (*Transaction, error) {
 	switch message := message.(type) {
 	case *pglogrepl.RelationMessage:
-		d.relations[message.RelationID] = message
+		d.relations[message.RelationID] = newRelationInfo(message)
 		return nil, nil
 
 	case *pglogrepl.BeginMessage:
 		if d.pending != nil {
 			return nil, ErrTransactionInProgress
 		}
-		d.pending = make([]Change, 0)
+		// A non-nil pending slice is what marks the transaction open, even
+		// with zero capacity.
+		d.pending = make([]Change, 0, d.pendingCapacityHint)
 		d.pendingXid = message.Xid
 		d.pendingCommitTime = message.CommitTime
 		d.pendingBytes = 0
@@ -134,11 +169,18 @@ func (d *Decoder) Consume(message pglogrepl.Message) (*Transaction, error) {
 		if d.pending == nil {
 			return nil, ErrNoTransaction
 		}
+		// The transaction takes ownership of the pending slice; the next
+		// BEGIN starts a fresh one, so nothing here is copied.
+		changes := d.pending
+		if len(changes) == 0 {
+			changes = nil
+		}
+		d.pendingCapacityHint = min(len(changes), maxPendingCapacityHint)
 		// The Decoder does not know which source it reads; the Reader stamps
 		// the cursor's source ID before handing the transaction to its sink.
 		transaction := &Transaction{
 			Cursor:     Cursor{lsn: message.TransactionEndLSN},
-			Changes:    append([]Change(nil), d.pending...),
+			Changes:    changes,
 			CommitTime: d.pendingCommitTime,
 			commitLSN:  message.CommitLSN,
 			xid:        d.pendingXid,
@@ -191,229 +233,281 @@ func (d *Decoder) Pending() (changes, bytes int) {
 }
 
 func (d *Decoder) insert(message *pglogrepl.InsertMessage) (Change, error) {
-	relation, err := d.relation(message.RelationID)
+	info, err := d.relation(message.RelationID)
 	if err != nil {
 		return Change{}, err
 	}
 
-	values, err := tupleValues(relation, message.Tuple, d.maxValueBytes)
+	values, err := decodeRow(info, message.Tuple, d.maxValueBytes)
 	if err != nil {
 		return Change{}, err
 	}
 
-	key, err := keyFromValues(relation, values)
+	key, err := keyFromValues(info, values)
 	if err != nil {
 		return Change{}, err
 	}
 
 	return Change{
 		Operation: OperationInsert,
-		Table:     relationTable(relation),
+		Table:     info.table,
 		Key:       key,
+		Columns:   info.columns,
 		Values:    values,
 	}, nil
 }
 
 func (d *Decoder) update(message *pglogrepl.UpdateMessage) (Change, error) {
-	relation, err := d.relation(message.RelationID)
+	info, err := d.relation(message.RelationID)
 	if err != nil {
 		return Change{}, err
 	}
 
-	values, err := tupleValues(relation, message.NewTuple, d.maxValueBytes)
+	values, err := decodeRow(info, message.NewTuple, d.maxValueBytes)
 	if err != nil {
 		return Change{}, err
 	}
 
-	key, err := keyFromValues(relation, values)
+	key, err := keyFromValues(info, values)
 	if err != nil {
 		return Change{}, err
 	}
 	if message.OldTuple != nil {
-		oldKey, err := keyFromTuple(relation, message.OldTuple, d.maxValueBytes)
-		if err != nil {
+		// The old key is only compared, so validate it in place rather than
+		// building a second key map.
+		if err := checkKeyTuple(info, message.OldTuple, d.maxValueBytes); err != nil {
 			return Change{}, err
 		}
-		if !maps.Equal(oldKey, key) {
-			return Change{}, ErrPrimaryKeyChangeUnsupported
+		for k, index := range info.keyIndexes {
+			if string(keyColumn(info, message.OldTuple.Columns, k).Data) != values[index].Text {
+				return Change{}, ErrPrimaryKeyChangeUnsupported
+			}
 		}
 	}
 
 	return Change{
 		Operation: OperationUpdate,
-		Table:     relationTable(relation),
+		Table:     info.table,
 		Key:       key,
+		Columns:   info.columns,
 		Values:    values,
 	}, nil
 }
 
 func (d *Decoder) delete(message *pglogrepl.DeleteMessage) (Change, error) {
-	relation, err := d.relation(message.RelationID)
+	info, err := d.relation(message.RelationID)
 	if err != nil {
 		return Change{}, err
 	}
 
-	key, err := keyFromTuple(relation, message.OldTuple, d.maxValueBytes)
-	if err != nil {
+	if err := checkKeyTuple(info, message.OldTuple, d.maxValueBytes); err != nil {
 		return Change{}, err
 	}
 
 	return Change{
 		Operation: OperationDelete,
-		Table:     relationTable(relation),
-		Key:       key,
+		Table:     info.table,
+		Key:       keyFromTuple(info, message.OldTuple.Columns),
 	}, nil
 }
 
-func (d *Decoder) relation(id uint32) (*pglogrepl.RelationMessage, error) {
-	relation := d.relations[id]
-	if relation == nil {
+func (d *Decoder) relation(id uint32) (*relationInfo, error) {
+	info := d.relations[id]
+	if info == nil {
 		return nil, fmt.Errorf("%w ID %d", ErrUnknownRelation, id)
 	}
 
-	return relation, nil
+	return info, nil
 }
 
-func relationTable(relation *pglogrepl.RelationMessage) string {
-	return qualifiedTable(relation.Namespace, relation.RelationName)
-}
-
-func tupleValues(relation *pglogrepl.RelationMessage, tuple *pglogrepl.TupleData, maxValueBytes int) (map[string]any, error) {
+// decodeRow decodes a complete row tuple into v0's value contract (see
+// Value). All of the row's text is copied into one string and each value is
+// a substring of it: one allocation per row rather than one per column. A
+// retained value or key therefore keeps the whole row's text alive, which
+// costs nothing extra while the Change itself is retained.
+func decodeRow(info *relationInfo, tuple *pglogrepl.TupleData, maxValueBytes int) ([]Value, error) {
 	if tuple == nil {
 		return nil, errors.New("cdc: row mutation is missing a tuple")
 	}
-
-	if len(tuple.Columns) != len(relation.Columns) {
-		return nil, fmt.Errorf("cdc: relation %s has %d columns but row tuple has %d", relationTable(relation), len(relation.Columns), len(tuple.Columns))
+	textBytes, err := checkRow(info, tuple, maxValueBytes)
+	if err != nil {
+		return nil, err
 	}
 
-	values := make(map[string]any, len(tuple.Columns))
-	for index, column := range tuple.Columns {
-		name := relation.Columns[index].Name
-		value, err := columnValue(column, maxValueBytes)
-		if err != nil {
-			return nil, fmt.Errorf("cdc: decode column %s: %w", name, err)
+	var builder strings.Builder
+	builder.Grow(textBytes)
+	for _, column := range tuple.Columns {
+		if column.DataType == pglogrepl.TupleDataTypeText {
+			builder.Write(column.Data)
 		}
-		values[name] = value
+	}
+	text := builder.String()
+
+	values := make([]Value, len(tuple.Columns))
+	offset := 0
+	for index, column := range tuple.Columns {
+		switch column.DataType {
+		case pglogrepl.TupleDataTypeText:
+			end := offset + len(column.Data)
+			values[index] = Value{Kind: ValueText, Text: text[offset:end]}
+			offset = end
+		case pglogrepl.TupleDataTypeToast:
+			values[index].Kind = ValueUnchangedToast
+		}
+		// TupleDataTypeNull is the zero Value.
 	}
 
 	return values, nil
 }
 
-func keyFromTuple(relation *pglogrepl.RelationMessage, tuple *pglogrepl.TupleData, maxValueBytes int) (map[string]string, error) {
-	if tuple == nil {
-		return nil, errors.New("cdc: delete mutation is missing its replica-identity tuple")
+// checkRow validates every column of a complete row tuple and returns the
+// total length of its text values.
+func checkRow(info *relationInfo, tuple *pglogrepl.TupleData, maxValueBytes int) (int, error) {
+	if len(tuple.Columns) != len(info.columns) {
+		return 0, fmt.Errorf("cdc: relation %s has %d columns but row tuple has %d", info.table, len(info.columns), len(tuple.Columns))
 	}
 
-	keyColumns := replicaIdentityColumns(relation)
-	if len(keyColumns) == 0 {
-		return nil, fmt.Errorf("cdc: relation %s has no replica-identity key columns", relationTable(relation))
-	}
-	if len(tuple.Columns) == len(relation.Columns) {
-		// PostgreSQL may send the complete old row (for example with REPLICA
-		// IDENTITY FULL) instead of a key-only tuple. Decode it as normal row
-		// state, then select the configured replica-identity columns.
-		values, err := tupleValues(relation, tuple, maxValueBytes)
-		if err != nil {
-			return nil, err
-		}
-		return keyFromValues(relation, values)
-	}
-	if len(tuple.Columns) != len(keyColumns) {
-		return nil, fmt.Errorf("cdc: relation %s key tuple has %d columns, want %d or %d", relationTable(relation), len(tuple.Columns), len(keyColumns), len(relation.Columns))
-	}
-
-	key := make(map[string]string, len(keyColumns))
+	textBytes := 0
 	for index, column := range tuple.Columns {
-		value, err := keyValue(column, maxValueBytes)
-		if err != nil {
-			return nil, fmt.Errorf("cdc: decode key %s: %w", keyColumns[index].Name, err)
+		if err := checkColumn(column, maxValueBytes); err != nil {
+			return 0, fmt.Errorf("cdc: decode column %s: %w", info.columns[index], err)
 		}
-		key[keyColumns[index].Name] = value
+		textBytes += len(column.Data)
+	}
+
+	return textBytes, nil
+}
+
+func keyFromValues(info *relationInfo, values []Value) (map[string]string, error) {
+	if len(info.keyIndexes) == 0 {
+		return nil, fmt.Errorf("cdc: relation %s has no replica-identity key columns", info.table)
+	}
+
+	key := make(map[string]string, len(info.keyIndexes))
+	for _, index := range info.keyIndexes {
+		value := values[index]
+		if value.Kind != ValueText || value.Text == "" {
+			return nil, fmt.Errorf("cdc: key %s is not a non-empty text value", info.columns[index])
+		}
+		key[info.columns[index]] = value.Text
 	}
 
 	return key, nil
 }
 
-func keyFromValues(relation *pglogrepl.RelationMessage, values map[string]any) (map[string]string, error) {
-	keyColumns := replicaIdentityColumns(relation)
-	if len(keyColumns) == 0 {
-		return nil, fmt.Errorf("cdc: relation %s has no replica-identity key columns", relationTable(relation))
+// checkKeyTuple validates an old-row tuple carrying a row's replica
+// identity. PostgreSQL sends either the key columns alone or, for example
+// with REPLICA IDENTITY FULL, the complete old row; a complete row is held
+// to the same rules as new row state.
+func checkKeyTuple(info *relationInfo, tuple *pglogrepl.TupleData, maxValueBytes int) error {
+	if tuple == nil {
+		return errors.New("cdc: delete mutation is missing its replica-identity tuple")
+	}
+	if len(info.keyIndexes) == 0 {
+		return fmt.Errorf("cdc: relation %s has no replica-identity key columns", info.table)
 	}
 
-	key := make(map[string]string, len(keyColumns))
-	for _, column := range keyColumns {
-		value, ok := values[column.Name]
-		if !ok {
-			return nil, fmt.Errorf("cdc: row state is missing key %s", column.Name)
+	switch len(tuple.Columns) {
+	case len(info.columns):
+		if _, err := checkRow(info, tuple, maxValueBytes); err != nil {
+			return err
 		}
-		stringValue, ok := value.(string)
-		if !ok || stringValue == "" {
-			return nil, fmt.Errorf("cdc: key %s is not a non-empty text value", column.Name)
+		for _, index := range info.keyIndexes {
+			column := tuple.Columns[index]
+			if column.DataType != pglogrepl.TupleDataTypeText || len(column.Data) == 0 {
+				return fmt.Errorf("cdc: key %s is not a non-empty text value", info.columns[index])
+			}
 		}
-		key[column.Name] = stringValue
+
+	case len(info.keyIndexes):
+		for k, column := range tuple.Columns {
+			if err := checkKeyColumn(column, maxValueBytes); err != nil {
+				return fmt.Errorf("cdc: decode key %s: %w", info.columns[info.keyIndexes[k]], err)
+			}
+		}
+
+	default:
+		return fmt.Errorf("cdc: relation %s key tuple has %d columns, want %d or %d", info.table, len(tuple.Columns), len(info.keyIndexes), len(info.columns))
 	}
 
-	return key, nil
+	return nil
 }
 
-func replicaIdentityColumns(relation *pglogrepl.RelationMessage) []*pglogrepl.RelationMessageColumn {
-	var keyColumns []*pglogrepl.RelationMessageColumn
-	for _, column := range relation.Columns {
-		if column.Flags == 1 {
-			keyColumns = append(keyColumns, column)
-		}
+// keyColumn returns the k-th replica-identity column of a tuple that
+// checkKeyTuple accepted, whether it is a complete row or key columns only.
+func keyColumn(info *relationInfo, columns []*pglogrepl.TupleDataColumn, k int) *pglogrepl.TupleDataColumn {
+	if len(columns) == len(info.columns) {
+		return columns[info.keyIndexes[k]]
 	}
-
-	return keyColumns
+	return columns[k]
 }
 
-// columnValue decodes one pgoutput column into v0's value contract: a
-// PostgreSQL text-format string, nil for SQL NULL, or UnchangedToast for a
-// TOAST column omitted from an UPDATE. See "Value encoding" in
-// docs/semantics.md. watchd never requests the pgoutput "binary" option, so
-// TupleDataTypeBinary and any other discriminator are rejected rather than
-// passed through as an opaque byte slice - this decoder has no way to
-// represent them under the text/null/unchanged-toast contract, and silently
-// forwarding raw bytes would let a protocol change mis-decode a value
-// instead of failing loudly.
-func columnValue(column *pglogrepl.TupleDataColumn, maxValueBytes int) (any, error) {
+// keyFromTuple builds the Key of a tuple that checkKeyTuple accepted, with
+// the key text in one string as decodeRow does for a row.
+func keyFromTuple(info *relationInfo, columns []*pglogrepl.TupleDataColumn) map[string]string {
+	textBytes := 0
+	for k := range info.keyIndexes {
+		textBytes += len(keyColumn(info, columns, k).Data)
+	}
+	var builder strings.Builder
+	builder.Grow(textBytes)
+	for k := range info.keyIndexes {
+		builder.Write(keyColumn(info, columns, k).Data)
+	}
+	text := builder.String()
+
+	key := make(map[string]string, len(info.keyIndexes))
+	offset := 0
+	for k, index := range info.keyIndexes {
+		end := offset + len(keyColumn(info, columns, k).Data)
+		key[info.columns[index]] = text[offset:end]
+		offset = end
+	}
+
+	return key
+}
+
+// checkColumn checks one pgoutput column against v0's value contract: a
+// PostgreSQL text-format value, SQL NULL, or a TOAST column omitted from an
+// UPDATE. See "Value encoding" in docs/semantics.md. watchd never requests
+// the pgoutput "binary" option, so TupleDataTypeBinary and any other
+// discriminator are rejected rather than passed through as an opaque byte
+// slice - this decoder has no way to represent them under the
+// text/null/unchanged-toast contract, and silently forwarding raw bytes
+// would let a protocol change mis-decode a value instead of failing loudly.
+func checkColumn(column *pglogrepl.TupleDataColumn, maxValueBytes int) error {
 	switch column.DataType {
-
-	case pglogrepl.TupleDataTypeNull:
-		return nil, nil
+	case pglogrepl.TupleDataTypeNull, pglogrepl.TupleDataTypeToast:
+		return nil
 
 	case pglogrepl.TupleDataTypeText:
 		if len(column.Data) > maxValueBytes {
-			return nil, fmt.Errorf("%w: %d bytes exceeds %d-byte limit", ErrValueTooLarge, len(column.Data), maxValueBytes)
+			return fmt.Errorf("%w: %d bytes exceeds %d-byte limit", ErrValueTooLarge, len(column.Data), maxValueBytes)
 		}
-		return string(column.Data), nil
-
-	case pglogrepl.TupleDataTypeToast:
-		return UnchangedToast{}, nil
+		return nil
 
 	default:
-		return nil, fmt.Errorf("%w: discriminator %q", ErrUnsupportedColumnEncoding, column.DataType)
+		return fmt.Errorf("%w: discriminator %q", ErrUnsupportedColumnEncoding, column.DataType)
 	}
 }
 
-func keyValue(column *pglogrepl.TupleDataColumn, maxValueBytes int) (string, error) {
+func checkKeyColumn(column *pglogrepl.TupleDataColumn, maxValueBytes int) error {
 	if column.DataType != pglogrepl.TupleDataTypeText {
-		return "", fmt.Errorf("%w: key is not text (type %q)", ErrUnsupportedColumnEncoding, column.DataType)
+		return fmt.Errorf("%w: key is not text (type %q)", ErrUnsupportedColumnEncoding, column.DataType)
 	}
 	if len(column.Data) == 0 {
-		return "", errors.New("key is empty")
+		return errors.New("key is empty")
 	}
 	if len(column.Data) > maxValueBytes {
-		return "", fmt.Errorf("%w: %d bytes exceeds %d-byte limit", ErrValueTooLarge, len(column.Data), maxValueBytes)
+		return fmt.Errorf("%w: %d bytes exceeds %d-byte limit", ErrValueTooLarge, len(column.Data), maxValueBytes)
 	}
 
-	return string(column.Data), nil
+	return nil
 }
 
 // estimatedChangeBytes is deliberately conservative. It accounts for all
-// retained strings and byte slices plus a fixed allowance for maps, slices,
-// and Go object headers. The exact allocator footprint is implementation
+// retained strings plus a fixed allowance for the key map, slices, and Go
+// object headers. The exact allocator footprint is implementation
 // dependent, but this provides a deterministic source-controlled bound.
 func estimatedChangeBytes(change Change) int {
 	const changeOverhead = 256
@@ -422,23 +516,16 @@ func estimatedChangeBytes(change Change) int {
 	for key, value := range change.Key {
 		bytes += len(key) + len(value)
 	}
-	for key, value := range change.Values {
-		bytes += len(key) + estimatedValueBytes(value)
+	for index, value := range change.Values {
+		bytes += len(change.Columns[index]) + estimatedValueBytes(value)
 	}
 	return bytes
 }
 
-func estimatedValueBytes(value any) int {
-	switch value := value.(type) {
-	case nil:
-		return 1
-	case string:
-		return len(value)
-	case UnchangedToast:
-		return 1
-	default:
-		// columnValue only creates the types above. Reserve a small amount if a
-		// future decoder adds another representation before this estimator does.
-		return 64
+func estimatedValueBytes(value Value) int {
+	if value.Kind == ValueText {
+		return len(value.Text)
 	}
+	// NULL and unchanged TOAST carry no text.
+	return 1
 }

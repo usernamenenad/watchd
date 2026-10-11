@@ -198,12 +198,12 @@ End to end, the latency is `watchd.cdc.commit_to_accept`, then `watchd.server.ba
 
 Instrumentation adds no allocations on the hot path: each instrument and attribute set is created once, and counts are added once per transaction, not once per change. `BenchmarkConsumeTransaction` in `internal/cdc` measures the reader's per-transaction path (14 pgoutput messages: relation, BEGIN, 10 inserts, COMMIT; decode, sink, acknowledge):
 
-| Meter | Time | Allocations |
+| Meter | Before #69 | After #69 |
 | --- | --- | --- |
-| No-op | ~13.9µs | 301 allocs, 13.3kB |
-| SDK | ~16.3µs | 301 allocs, 13.3kB |
+| No-op | ~36.7µs, 301 allocs, 13.0kB | ~16.0µs, 171 allocs, 7.9kB |
+| SDK | ~40.7µs, 301 allocs, 13.0kB | ~16.9µs, 171 allocs, 7.9kB |
 
-The instrumented path costs about 2µs per transaction, mostly histogram recording and clock reads, and allocates nothing. The allocations are decoding's own. Measured with Go 1.27 on a 16-thread x86-64 machine. Run `go test ./internal/cdc -run '^$' -bench ConsumeTransaction -benchmem`.
+The instrumented path costs about 1-2µs per transaction, mostly histogram recording and clock reads, and allocates nothing. The allocations are decoding's own. Since #69 the decoder allocates about four times per row change (the row's text, its values, and its key map), and most of the rest is pglogrepl parsing the message. `BenchmarkDecoderConsume` measures the decoder alone on one transaction of an insert, an update, and two deletes: ~8.4µs and 61 allocs before #69, ~2.8µs and 16 allocs after. Measured with Go 1.27 on a 16-thread i5-1250P laptop, where absolute times vary between runs; compare before and after in one session. Run `go test ./internal/cdc -run '^$' -bench 'ConsumeTransaction|DecoderConsume' -benchmem -count=10` and compare runs with `benchstat`.
 
 `BenchmarkHubAccept` in `internal/watch` measures fanning one two-change transaction out to N watchers. The transaction concerns either no watcher or the one watcher of a single scope:
 

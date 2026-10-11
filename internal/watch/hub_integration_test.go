@@ -184,7 +184,11 @@ func (w *projectionWatcher) apply(event Event) error {
 				delete(w.rows, change.Key["user_id"])
 				continue
 			}
-			w.rows[change.Key["user_id"]] = change.Values["permissions"].(string)
+			permissions, _ := change.Value("permissions")
+			if permissions.Kind != cdc.ValueText {
+				return fmt.Errorf("permissions = %s, want text", permissions)
+			}
+			w.rows[change.Key["user_id"]] = permissions.Text
 		}
 	case Resync:
 		return fmt.Errorf("unexpected resync: %s", event.Reason)
