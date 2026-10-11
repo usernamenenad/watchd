@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -155,6 +156,55 @@ func TestWatchTranslatesEveryEvent(t *testing.T) {
 	}
 	if watcher.got != (watch.Request{Projection: "permissions", Scope: "tenant-a"}) {
 		t.Fatalf("watch request = %+v", watcher.got)
+	}
+}
+
+// TestSharedBatchIsEncodedOnceForEveryStream sends one batch, shared by its
+// Memo as the hub shares a scope's batch, on two streams. Both must receive
+// exactly what an unshared batch encodes to, from one encoding.
+func TestSharedBatchIsEncodedOnceForEveryStream(t *testing.T) {
+	cursor := cdc.NewCursorForTest(testSource, 0x2A)
+	commitTime := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	changes := []cdc.Change{{
+		Operation: cdc.OperationUpdate,
+		Table:     "public.permissions",
+		Key:       map[string]string{"id": "1"},
+		Columns:   []string{"id", "note", "blob"},
+		Values:    []cdc.Value{cdc.TextValue("1"), {Kind: cdc.ValueNull}, {Kind: cdc.ValueUnchangedToast}},
+	}}
+	unshared := watch.Batch{Cursor: cursor, CommitTime: commitTime, Changes: changes}
+	shared := unshared
+	shared.Memo = new(watch.Memo)
+
+	_, client, _ := startServer(t, &scriptedWatcher{events: []watch.Event{unshared}})
+	want, err := receiveAll(t, client, &watchv1.WatchRequest{Projection: "p"})
+	if err != nil || len(want) != 1 {
+		t.Fatalf("unshared batch: %v, %v", want, err)
+	}
+
+	_, client, _ = startServer(t, &scriptedWatcher{events: []watch.Event{shared}})
+	for stream := range 2 {
+		got, err := receiveAll(t, client, &watchv1.WatchRequest{Projection: "p"})
+		if err != nil || len(got) != 1 || !proto.Equal(got[0], want[0]) {
+			t.Fatalf("stream %d received %v, %v; want %v", stream, got, err, want)
+		}
+	}
+	if _, err := shared.Memo.Load(func() (any, error) { return nil, errors.New("memo was empty") }); err != nil {
+		t.Fatalf("the shared batch was not encoded through its memo: %v", err)
+	}
+}
+
+func TestSharedBatchThatCannotBeConvertedFailsEveryStream(t *testing.T) {
+	invalid := watch.Batch{
+		Cursor:  cdc.NewCursorForTest(testSource, 0x2A),
+		Changes: []cdc.Change{{Operation: "truncate", Table: "public.permissions"}},
+		Memo:    new(watch.Memo),
+	}
+	_, client, _ := startServer(t, &scriptedWatcher{events: []watch.Event{invalid}})
+	for stream := range 2 {
+		if _, err := receiveAll(t, client, &watchv1.WatchRequest{Projection: "p"}); status.Code(err) != codes.Internal {
+			t.Fatalf("stream %d: error = %v, want Internal", stream, err)
+		}
 	}
 }
 

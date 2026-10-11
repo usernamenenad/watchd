@@ -139,7 +139,14 @@ func (s *watchStream) next(t *testing.T) Event {
 func (s *watchStream) expect(t *testing.T, want ...Event) {
 	t.Helper()
 	for index, expected := range want {
-		if got := s.next(t); !reflect.DeepEqual(got, expected) {
+		got := s.next(t)
+		// Whether a batch is shared is checked on its own, by
+		// TestWatchersOfOneScopeShareTheirBatchesMemo.
+		if batch, ok := got.(Batch); ok {
+			batch.Memo = nil
+			got = batch
+		}
+		if !reflect.DeepEqual(got, expected) {
 			t.Fatalf("event %d = %#v, want %#v", index, got, expected)
 		}
 	}
@@ -264,6 +271,28 @@ func TestWatchersOfOneScopeEachReceiveItsTransactions(t *testing.T) {
 	accept(t, hub, t2)
 	a2.expect(t, batch(t2, change(tenantA, "u3")), Progress{Cursor: t2.Cursor})
 	b.expect(t, Progress{Cursor: t2.Cursor})
+}
+
+// TestWatchersOfOneScopeShareTheirBatchesMemo checks that the watchers of
+// one scope receive a live batch with one shared Memo, so its consumers
+// derive its encoding once, and that a scope with one watcher gets none.
+func TestWatchersOfOneScopeShareTheirBatchesMemo(t *testing.T) {
+	hub := newTestHub(t, &fakeSnapshotter{snapshot: cdc.NewSnapshotForTest(testSource, 50, 1, 1)})
+	var streams []*watchStream
+	for _, scope := range []string{tenantA, tenantA, tenantB} {
+		stream := startWatch(t, hub, Request{Projection: "permissions", Scope: scope})
+		stream.expect(t, SnapshotBegin{}, SnapshotRows{}, SnapshotEnd{}, Progress{Cursor: cursor(50)})
+		streams = append(streams, stream)
+	}
+
+	accept(t, hub, transaction(100, 5, change(tenantA, "u1"), change(tenantB, "u1")))
+	a1, a2, b := streams[0].next(t).(Batch), streams[1].next(t).(Batch), streams[2].next(t).(Batch)
+	if a1.Memo == nil || a1.Memo != a2.Memo {
+		t.Fatalf("tenant A memos = %p, %p; want one shared memo", a1.Memo, a2.Memo)
+	}
+	if b.Memo != nil {
+		t.Fatalf("lone tenant B watcher memo = %p, want nil", b.Memo)
+	}
 }
 
 // TestTransactionTouchingManyScopesKeepsEachScopesChangesInOrder covers

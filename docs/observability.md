@@ -214,6 +214,16 @@ The instrumented path costs about 1-2µs per transaction, mostly histogram recor
 | 1,000 | ~58µs | ~600ns | ~910ns | ~960ns | ~1.4µs |
 | 10,000 | ~680µs | ~550ns | ~860ns | ~870ns | ~1.2µs |
 
-Accept allocates nothing when a transaction concerns no watcher. When it concerns one or more, it allocates once for each scope it touches, for the changes that scope's watchers share. The instruments cost a roughly constant ~350ns per transaction: two histogram records and three clock reads. Before #68, routing checked every watcher's scope against every transaction, so its cost grew linearly with the number of watchers. Measured with Go 1.27 on a 16-thread i5-1250P laptop, where results vary by ±15%. Run `go test ./internal/watch -run '^$' -bench HubAccept -count=6` and compare runs with `benchstat`.
+Accept allocates nothing when a transaction concerns no watcher. When it concerns one or more, it allocates once for each scope it touches, for the changes that scope's watchers share, and once more for a scope with several watchers, for the `Memo` they share (#70). The instruments cost a roughly constant ~350ns per transaction: two histogram records and three clock reads. Before #68, routing checked every watcher's scope against every transaction, so its cost grew linearly with the number of watchers. Measured with Go 1.27 on a 16-thread i5-1250P laptop, where results vary by ±15%. Run `go test ./internal/watch -run '^$' -bench HubAccept -count=6` and compare runs with `benchstat`.
+
+`BenchmarkSendBatch` in `internal/server` measures serving one transaction, an 8-column update, to N watchers of one scope, each on its own stream, through gRPC's proto codec:
+
+| Watchers | Before #70 (each stream encodes) | After #70 (encoded once per scope) |
+| --- | --- | --- |
+| 1 | ~8.6µs, 55 allocs, 2.1kB | same (a lone watcher shares nothing) |
+| 100 | ~962µs, 5,500 allocs, 210kB | ~85µs, 454 allocs, 51kB |
+| 1,000 | ~9.6ms, 55,004 allocs, 2.1MB | ~752µs, 4,054 allocs, 495kB |
+
+Before #70, every stream converted the batch to protobuf and marshaled it, about 9.6µs and 55 allocations each. Most of that was the marshal, not the conversion. Now the first stream of a scope does both once, and each stream re-sends the encoded bytes for about 0.75µs and 4 allocations. Measured with Go 1.27 on a 16-thread i5-1250P laptop. Run `go test ./internal/server -run '^$' -bench SendBatch -benchmem -count=8` and compare the modes with `benchstat -col /mode`.
 
 The SDK instruments add two histogram records and two clock reads per batch applied.

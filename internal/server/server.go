@@ -166,19 +166,11 @@ func (s *Server) send(stream grpc.ServerStreamingServer[watchv1.WatchResponse], 
 		return s.sendMessage(stream, &watchv1.WatchResponse{Event: &watchv1.WatchResponse_SnapshotEnd{SnapshotEnd: &watchv1.SnapshotEnd{}}})
 
 	case watch.Batch:
-		changes := make([]*watchv1.Change, 0, len(event.Changes))
-		for _, change := range event.Changes {
-			converted, err := convertChange(change)
-			if err != nil {
-				return err
-			}
-			changes = append(changes, converted)
+		message, err := s.batchMessage(event)
+		if err != nil {
+			return err
 		}
-		batch := &watchv1.Batch{Cursor: s.encodeCursor(event.Cursor), Changes: changes}
-		if !event.CommitTime.IsZero() {
-			batch.CommitTime = timestamppb.New(event.CommitTime)
-		}
-		if err := s.sendMessage(stream, &watchv1.WatchResponse{Event: &watchv1.WatchResponse_Batch{Batch: batch}}); err != nil {
+		if err := s.sendMessage(stream, message); err != nil {
 			return err
 		}
 		if !event.CommitTime.IsZero() {
@@ -199,6 +191,58 @@ func (s *Server) send(stream grpc.ServerStreamingServer[watchv1.WatchResponse], 
 	default:
 		return fmt.Errorf("server: unknown watch event %T", event)
 	}
+}
+
+// batchMessage returns the stream message for batch. A batch delivered to
+// several watchers of one scope is converted and marshaled once, through
+// its Memo, and every stream sends those bytes; see encodedMessage.
+func (s *Server) batchMessage(batch watch.Batch) (*watchv1.WatchResponse, error) {
+	if batch.Memo == nil {
+		return s.convertBatch(batch)
+	}
+	message, err := batch.Memo.Load(func() (any, error) {
+		converted, err := s.convertBatch(batch)
+		if err != nil {
+			return nil, err
+		}
+		return encodedMessage(converted)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return message.(*watchv1.WatchResponse), nil
+}
+
+func (s *Server) convertBatch(batch watch.Batch) (*watchv1.WatchResponse, error) {
+	changes := make([]*watchv1.Change, 0, len(batch.Changes))
+	for _, change := range batch.Changes {
+		converted, err := convertChange(change)
+		if err != nil {
+			return nil, err
+		}
+		changes = append(changes, converted)
+	}
+	message := &watchv1.Batch{Cursor: s.encodeCursor(batch.Cursor), Changes: changes}
+	if !batch.CommitTime.IsZero() {
+		message.CommitTime = timestamppb.New(batch.CommitTime)
+	}
+	return &watchv1.WatchResponse{Event: &watchv1.WatchResponse_Batch{Batch: message}}, nil
+}
+
+// encodedMessage marshals message once and returns an equivalent message
+// that holds only those bytes, as unknown fields. Marshaling it again copies
+// the bytes instead of encoding every field, so streams sharing it pay for
+// a copy, not an encoding: the proto codec and any compression still run
+// per stream as usual. The receiver sees the original message. It is never
+// modified after this, so concurrent streams may marshal it.
+func encodedMessage(message *watchv1.WatchResponse) (*watchv1.WatchResponse, error) {
+	data, err := proto.Marshal(message)
+	if err != nil {
+		return nil, fmt.Errorf("server: encode batch: %w", err)
+	}
+	encoded := &watchv1.WatchResponse{}
+	encoded.ProtoReflect().SetUnknown(data)
+	return encoded, nil
 }
 
 // sendRows packs rows into messages of about maxRowsMessageBytes each.

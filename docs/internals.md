@@ -380,7 +380,7 @@ The live events are `Batch` (one transaction's relevant changes, never split) an
 1. Drop duplicates. After a reconnect, PostgreSQL may resend a transaction the hub already has. `order <= 0` means nothing new.
 2. Append to the ring and evict the oldest entries. Eviction raises `floor`.
 3. Routing: for each change, look up `routes[table]`. That gives the watchers grouped by scope column, then by scope value: `change.Key[scopeColumn]`. *Why index by scope:* with 10,000 watchers, Accept visits only the few that care, instead of all of them.
-4. Group each scope's changes into one shared `delivery`. Every watcher of that scope gets the same slice.
+4. Group each scope's changes into one shared `delivery`. Every watcher of that scope gets the same slice. When a scope has several watchers, they also share one `Memo`, so the server encodes their batch once (see `server.go`).
 5. Do a non-blocking send to each watcher's queue. **If the queue is full, the watcher is dropped** (`dropLocked`) and gets `Resync(SlowWatcher)`. *Why:* the alternative is that one slow client stalls ingestion for everyone and makes PostgreSQL retain WAL.
 6. The scratch slices and the map are reused between calls. A transaction no watcher cares about allocates nothing.
 7. `tick` is closed **after** unlocking, so woken watchers don't immediately contend for the lock.
@@ -438,6 +438,9 @@ Ring occupancy, oldest-entry age, watcher count, queue depth, watcher lag, evict
 - **`CompareCursors`.** Clients compare cursors through this RPC instead of parsing them.
 - **`sendRows`.** Packs snapshot rows into messages of about `MaxRowsMessageBytes` (1 MiB). *Why:* gRPC has message size limits, and big messages hurt latency.
 - **Batches are never split**, because one batch is one atomic transaction. They are bounded by the source's `MaxTransactionBytes`, which is why the SDK raises its receive limit to 64 MiB.
+- **`batchMessage`, `encodedMessage`.** A batch shared by several watchers of a scope (one with a `Memo`) is converted and marshaled **once**. Every stream then sends a `WatchResponse` that holds only those bytes, as protobuf "unknown fields". Marshaling that message again just copies the bytes, and the client decodes the original message.
+  - *Why:* marshaling is most of the cost, about 6µs of a 9.6µs send for an 8-column update. Encoding it once per scope instead of once per watcher cuts serving 1,000 same-scope watchers from about 9.6ms to 0.75ms.
+  - *Why not a custom codec or `grpc.PreparedMsg`:* `PreparedMsg` is compressed for one stream, so it would be wrong to share across clients that negotiate different compression. Here the normal codec and compression still run for each stream.
 - **`convertChange`, `convertChangeValues`.** Turn `cdc.Value` kinds into the protobuf `Value` oneof (text, null, or unchanged TOAST).
 - **`convertRow`, `convertValues`.** The same for snapshot rows. Those rows can never contain unchanged TOAST.
 - **`status`.** Maps errors to gRPC codes:

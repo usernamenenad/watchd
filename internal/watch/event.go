@@ -2,6 +2,7 @@ package watch
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/usernamenenad/watchd/internal/cdc"
@@ -42,7 +43,34 @@ type Batch struct {
 	// CommitTime is when the transaction committed, by the source's clock.
 	// It is informational, for measuring latency; order comes from Cursor.
 	CommitTime time.Time
-	Changes    []cdc.Change
+	// Changes are shared with every other watcher of the same scope, and
+	// must not be modified.
+	Changes []cdc.Change
+	// Memo is shared by every watcher the batch was delivered to live, so
+	// work derived from the batch is done once per scope rather than once
+	// per watcher. It is nil when the batch is not shared.
+	Memo *Memo
+}
+
+// Memo holds one value derived from a Batch, computed by the first watcher
+// that needs it and reused by the rest. Every caller of one Memo must derive
+// the same value from the same batch: a Batch's consumer, such as the
+// server encoding it for the wire, owns what the value is.
+type Memo struct {
+	once  sync.Once
+	value any
+	err   error
+}
+
+// Load returns the memo's value, calling compute to produce it if no caller
+// has yet. Concurrent callers wait for the one computing it. A nil Memo
+// shares nothing: Load calls compute every time.
+func (m *Memo) Load(compute func() (any, error)) (any, error) {
+	if m == nil {
+		return compute()
+	}
+	m.once.Do(func() { m.value, m.err = compute() })
+	return m.value, m.err
 }
 
 // Progress states that every relevant committed change through Cursor has

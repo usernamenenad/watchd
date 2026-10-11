@@ -144,6 +144,9 @@ type deliveryKey struct {
 type queued struct {
 	transaction cdc.Transaction
 	changes     []cdc.Change
+	// memo is shared by every watcher of the delivery, or nil when the
+	// delivery has one watcher.
+	memo *Memo
 }
 
 type projection struct {
@@ -260,9 +263,16 @@ func (h *Hub) Accept(ctx context.Context, transaction cdc.Transaction) error {
 	}
 	for i := range h.deliveries {
 		d := &h.deliveries[i]
+		// Watchers of one scope receive the same batch, so work derived from
+		// it, such as its wire encoding, is shared. A lone watcher has
+		// nothing to share it with.
+		var memo *Memo
+		if len(d.watchers) > 1 {
+			memo = new(Memo)
+		}
 		for _, w := range d.watchers {
 			select {
-			case w.queue <- queued{transaction: transaction, changes: d.changes}:
+			case w.queue <- queued{transaction: transaction, changes: d.changes, memo: memo}:
 			default:
 				h.dropLocked(w)
 			}
@@ -486,7 +496,7 @@ func (h *Hub) live(ctx context.Context, w *watcher, base cdc.Cursor, baseSafe bo
 					return err
 				}
 				if deliver {
-					if err := send(Batch{Cursor: item.transaction.Cursor, CommitTime: item.transaction.CommitTime, Changes: item.changes}); err != nil {
+					if err := send(Batch{Cursor: item.transaction.Cursor, CommitTime: item.transaction.CommitTime, Changes: item.changes, Memo: item.memo}); err != nil {
 						return err
 					}
 				}
