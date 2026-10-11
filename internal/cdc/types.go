@@ -27,19 +27,77 @@ const (
 // Key contains the stable replica-identity columns needed to identify a row.
 // A replica-identity column is always sent in full by PostgreSQL, so every
 // Key entry is a non-empty PostgreSQL text value - never NULL, never
-// TOAST-omitted, and never absent. Values contains the resulting row state
-// for inserts and updates. Every value is one of: a string holding the
-// column's PostgreSQL text representation (the same text `column::text`
-// would produce, for every column type including bytea, arrays, composite
-// types, json/jsonb, enums, and domain types - watchd does not request
-// pgoutput's binary option, so encoding is uniform across types), nil for
-// SQL NULL, or UnchangedToast for a TOAST column omitted from an UPDATE
-// because it did not change. See "Value encoding" in docs/semantics.md.
+// TOAST-omitted, and never absent.
+//
+// Columns and Values hold the resulting row state for inserts and updates:
+// Values[i] is the value of column Columns[i], in the relation's column
+// order. Both are nil for a delete. Columns is shared by every change of the
+// same relation and must not be modified. See Value for the value contract
+// and "Value encoding" in docs/semantics.md.
 type Change struct {
 	Operation string
 	Table     string
 	Key       map[string]string
-	Values    map[string]any
+	Columns   []string
+	Values    []Value
+}
+
+// Value returns the value of column name and whether the row has that column.
+func (c Change) Value(name string) (Value, bool) {
+	for i, column := range c.Columns {
+		if column == name {
+			return c.Values[i], true
+		}
+	}
+	return Value{}, false
+}
+
+// ValueKind distinguishes the three kinds of column value v0 carries.
+type ValueKind uint8
+
+const (
+	// ValueNull is SQL NULL.
+	ValueNull ValueKind = iota
+	// ValueText is a column's PostgreSQL text representation.
+	ValueText
+	// ValueUnchangedToast is a TOAST column PostgreSQL omitted from an UPDATE
+	// because it did not change. A projection applier must retain its
+	// existing value for that column.
+	ValueUnchangedToast
+)
+
+func (k ValueKind) String() string {
+	switch k {
+	case ValueNull:
+		return "null"
+	case ValueText:
+		return "text"
+	case ValueUnchangedToast:
+		return "unchanged-toast"
+	default:
+		return fmt.Sprintf("ValueKind(%d)", uint8(k))
+	}
+}
+
+// Value is one column value of a Change. Text is set only for ValueText and
+// holds the same text `column::text` would produce, for every column type
+// including bytea, arrays, composite types, json/jsonb, enums, and domain
+// types - watchd does not request pgoutput's binary option, so encoding is
+// uniform across types. An empty Text with ValueText is the empty string,
+// distinct from ValueNull.
+type Value struct {
+	Kind ValueKind
+	Text string
+}
+
+// TextValue returns a ValueText value holding text.
+func TextValue(text string) Value { return Value{Kind: ValueText, Text: text} }
+
+func (v Value) String() string {
+	if v.Kind == ValueText {
+		return v.Text
+	}
+	return v.Kind.String()
 }
 
 // Transaction is an atomic batch of committed source changes.
@@ -219,25 +277,16 @@ func (s Snapshot) Covers(t Transaction) (bool, error) {
 type TransactionSink func(context.Context, Transaction) error
 
 // SnapshotRowSink receives one batch of a scoped snapshot read at a time, in
-// primary-key order, within the read's consistent snapshot transaction. Like
-// Change.Values, row values are their PostgreSQL text representation or nil
-// for SQL NULL. Returning an error aborts the read; no cursor is returned
+// primary-key order, within the read's consistent snapshot transaction. Row
+// values are their PostgreSQL text representation as a string, or nil for
+// SQL NULL; a snapshot row is a full read and never omits a TOAST column. Returning an error aborts the read; no cursor is returned
 // and the read's transaction is rolled back.
 type SnapshotRowSink func(context.Context, []map[string]any) error
-
-// UnchangedToast represents a PostgreSQL TOAST value omitted from an UPDATE
-// message because that column did not change. A projection applier must retain
-// its existing value for that column.
-type UnchangedToast struct{}
-
-func (UnchangedToast) String() string {
-	return "unchanged-toast"
-}
 
 func qualifiedTable(namespace, relation string) string {
 	if namespace == "" {
 		return relation
 	}
 
-	return fmt.Sprintf("%s.%s", namespace, relation)
+	return namespace + "." + relation
 }

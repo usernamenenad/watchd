@@ -32,11 +32,8 @@ func TestDecoderEmitsOnlyCommittedTransaction(t *testing.T) {
 			Operation: OperationInsert,
 			Table:     "public.tenant_permissions_projection",
 			Key:       map[string]string{"tenant_id": "acme", "user_id": "alice"},
-			Values: map[string]any{
-				"tenant_id":   "acme",
-				"user_id":     "alice",
-				"permissions": "editor",
-			},
+			Columns:   []string{"tenant_id", "user_id", "permissions"},
+			Values:    []Value{TextValue("acme"), TextValue("alice"), TextValue("editor")},
 		}},
 	}
 	if !reflect.DeepEqual(transaction, want) {
@@ -65,7 +62,7 @@ func TestDecoderPreservesUpdateAndDeleteInOneTransaction(t *testing.T) {
 	if got, want := len(transaction.Changes), 2; got != want {
 		t.Fatalf("changes = %d, want %d", got, want)
 	}
-	if change := transaction.Changes[0]; change.Operation != OperationUpdate || change.Values["permissions"] != "admin" {
+	if change := transaction.Changes[0]; change.Operation != OperationUpdate || change.Values[2] != TextValue("admin") {
 		t.Fatalf("update = %#v", change)
 	}
 	if change := transaction.Changes[1]; change.Operation != OperationDelete || !reflect.DeepEqual(change.Key, map[string]string{"tenant_id": "acme", "user_id": "bob"}) {
@@ -198,17 +195,11 @@ func TestDecoderDistinguishesNullFromUnchangedToast(t *testing.T) {
 		t.Fatalf("commit: %v", err)
 	}
 
-	insertValue := transaction.Changes[0].Values["permissions"]
-	if insertValue != nil {
-		t.Fatalf("null value = %#v, want nil", insertValue)
+	if insertValue, _ := transaction.Changes[0].Value("permissions"); insertValue != (Value{Kind: ValueNull}) {
+		t.Fatalf("null value = %#v, want ValueNull", insertValue)
 	}
-
-	updateValue := transaction.Changes[1].Values["permissions"]
-	if _, ok := updateValue.(UnchangedToast); !ok {
-		t.Fatalf("unchanged-toast value = %#v (%T), want UnchangedToast", updateValue, updateValue)
-	}
-	if updateValue == nil {
-		t.Fatalf("unchanged-toast value must not equal nil")
+	if updateValue, _ := transaction.Changes[1].Value("permissions"); updateValue != (Value{Kind: ValueUnchangedToast}) {
+		t.Fatalf("unchanged-toast value = %#v, want ValueUnchangedToast", updateValue)
 	}
 }
 
@@ -313,5 +304,196 @@ func mustConsume(t *testing.T, decoder *Decoder, message pglogrepl.Message) {
 	}
 	if transaction != nil {
 		t.Fatalf("consume %T returned unexpected transaction %#v", message, transaction)
+	}
+}
+
+// BenchmarkDecoderConsume measures the decoder alone, on pre-parsed messages:
+// one transaction with an insert, an update carrying its old key, a key-only
+// delete, and a delete carrying the full old row (REPLICA IDENTITY FULL).
+func BenchmarkDecoderConsume(b *testing.B) {
+	relation := sampleRelation()
+	messages := []pglogrepl.Message{
+		&pglogrepl.BeginMessage{Xid: 731},
+		&pglogrepl.InsertMessage{RelationID: relation.RelationID, Tuple: fullTuple("acme", "alice", "editor")},
+		&pglogrepl.UpdateMessage{RelationID: relation.RelationID, OldTuple: keyTuple("acme", "alice"), NewTuple: fullTuple("acme", "alice", "admin")},
+		&pglogrepl.DeleteMessage{RelationID: relation.RelationID, OldTuple: keyTuple("acme", "bob")},
+		&pglogrepl.DeleteMessage{RelationID: relation.RelationID, OldTuple: fullTuple("acme", "carol", "viewer")},
+		&pglogrepl.CommitMessage{CommitLSN: 42, TransactionEndLSN: 90},
+	}
+	decoder := NewDecoder()
+	if _, err := decoder.Consume(relation); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		for _, message := range messages {
+			if _, err := decoder.Consume(message); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
+
+func TestDecoderRejectsPrimaryKeyUpdateWithFullOldTuple(t *testing.T) {
+	decoder := NewDecoder()
+	relation := sampleRelation()
+	mustConsume(t, decoder, relation)
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+
+	_, err := decoder.Consume(&pglogrepl.UpdateMessage{
+		RelationID: relation.RelationID,
+		OldTuple:   fullTuple("acme", "alice", "editor"),
+		NewTuple:   fullTuple("acme", "bob", "editor"),
+	})
+	if !errors.Is(err, ErrPrimaryKeyChangeUnsupported) {
+		t.Fatalf("error = %v, want %v", err, ErrPrimaryKeyChangeUnsupported)
+	}
+}
+
+func TestDecoderAcceptsUpdateWithUnchangedFullOldTuple(t *testing.T) {
+	decoder := NewDecoder()
+	relation := sampleRelation()
+	mustConsume(t, decoder, relation)
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+	mustConsume(t, decoder, &pglogrepl.UpdateMessage{
+		RelationID: relation.RelationID,
+		OldTuple:   fullTuple("acme", "alice", "editor"),
+		NewTuple:   fullTuple("acme", "alice", "admin"),
+	})
+}
+
+func TestDecoderRejectsNullKeyInFullOldTuple(t *testing.T) {
+	decoder := NewDecoder()
+	relation := sampleRelation()
+	mustConsume(t, decoder, relation)
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+
+	_, err := decoder.Consume(&pglogrepl.DeleteMessage{
+		RelationID: relation.RelationID,
+		OldTuple: &pglogrepl.TupleData{Columns: []*pglogrepl.TupleDataColumn{
+			textColumn("acme"),
+			nullColumn(),
+			textColumn("editor"),
+		}},
+	})
+	if err == nil || err.Error() != "cdc: key user_id is not a non-empty text value" {
+		t.Fatalf("error = %v, want a non-empty key error", err)
+	}
+}
+
+func TestDecoderDistinguishesEmptyTextFromNull(t *testing.T) {
+	decoder := NewDecoder()
+	relation := sampleRelation()
+	mustConsume(t, decoder, relation)
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+	mustConsume(t, decoder, &pglogrepl.InsertMessage{
+		RelationID: relation.RelationID,
+		Tuple:      fullTuple("acme", "alice", ""),
+	})
+
+	transaction, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 46})
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got, want := transaction.Changes[0].Values, []Value{TextValue("acme"), TextValue("alice"), TextValue("")}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("values = %#v, want %#v", got, want)
+	}
+}
+
+// Decoded values must not alias the message's buffers: pgoutput tuple data
+// belongs to the replication connection, and a Change outlives the message.
+func TestDecoderCopiesTupleData(t *testing.T) {
+	decoder := NewDecoder()
+	relation := sampleRelation()
+	insert := fullTuple("acme", "alice", "editor")
+	deleted := keyTuple("acme", "bob")
+	mustConsume(t, decoder, relation)
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+	mustConsume(t, decoder, &pglogrepl.InsertMessage{RelationID: relation.RelationID, Tuple: insert})
+	mustConsume(t, decoder, &pglogrepl.DeleteMessage{RelationID: relation.RelationID, OldTuple: deleted})
+	transaction, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 47})
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	for _, tuple := range []*pglogrepl.TupleData{insert, deleted} {
+		for _, column := range tuple.Columns {
+			for i := range column.Data {
+				column.Data[i] = 'x'
+			}
+		}
+	}
+
+	if got, want := transaction.Changes[0].Values, []Value{TextValue("acme"), TextValue("alice"), TextValue("editor")}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("insert values = %#v, want %#v", got, want)
+	}
+	if got, want := transaction.Changes[0].Key, map[string]string{"tenant_id": "acme", "user_id": "alice"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("insert key = %#v, want %#v", got, want)
+	}
+	if got, want := transaction.Changes[1].Key, map[string]string{"tenant_id": "acme", "user_id": "bob"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("delete key = %#v, want %#v", got, want)
+	}
+}
+
+// A committed Transaction owns its Changes: the next transaction must not
+// write into the same backing array.
+func TestDecoderTransactionsDoNotShareChanges(t *testing.T) {
+	decoder := NewDecoder()
+	relation := sampleRelation()
+	mustConsume(t, decoder, relation)
+
+	commit := func(userID string) *Transaction {
+		t.Helper()
+		mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+		mustConsume(t, decoder, &pglogrepl.InsertMessage{RelationID: relation.RelationID, Tuple: fullTuple("acme", userID, "editor")})
+		transaction, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 48})
+		if err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		return transaction
+	}
+
+	first := commit("alice")
+	commit("bob")
+	if got := first.Changes[0].Key["user_id"]; got != "alice" {
+		t.Fatalf("first transaction's change was overwritten: user_id = %q", got)
+	}
+}
+
+func TestDecoderEmptyTransactionHasNoChanges(t *testing.T) {
+	decoder := NewDecoder()
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+	transaction, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 49})
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if transaction.Changes != nil {
+		t.Fatalf("changes = %#v, want nil", transaction.Changes)
+	}
+}
+
+// A new RelationMessage (for example after ALTER TABLE) must not rename the
+// columns of changes already decoded under the old one.
+func TestDecoderRelationUpdateKeepsDecodedColumns(t *testing.T) {
+	decoder := NewDecoder()
+	relation := sampleRelation()
+	mustConsume(t, decoder, relation)
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+	mustConsume(t, decoder, &pglogrepl.InsertMessage{RelationID: relation.RelationID, Tuple: fullTuple("acme", "alice", "editor")})
+
+	renamed := sampleRelation()
+	renamed.Columns[2].Name = "role"
+	mustConsume(t, decoder, renamed)
+	mustConsume(t, decoder, &pglogrepl.InsertMessage{RelationID: relation.RelationID, Tuple: fullTuple("acme", "bob", "viewer")})
+
+	transaction, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 50})
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := transaction.Changes[0].Columns[2]; got != "permissions" {
+		t.Fatalf("first change column = %q, want permissions", got)
+	}
+	if got := transaction.Changes[1].Columns[2]; got != "role" {
+		t.Fatalf("second change column = %q, want role", got)
 	}
 }

@@ -261,11 +261,32 @@ func convertChange(change cdc.Change) (*watchv1.Change, error) {
 	if !ok {
 		return nil, fmt.Errorf("server: unknown change operation %q", change.Operation)
 	}
-	values, err := convertValues(change.Values)
+	values, err := convertChangeValues(change.Columns, change.Values)
 	if err != nil {
 		return nil, err
 	}
 	return &watchv1.Change{Operation: operation, Table: change.Table, Key: change.Key, Values: values}, nil
+}
+
+func convertChangeValues(columns []string, values []cdc.Value) (map[string]*watchv1.Value, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	converted := make(map[string]*watchv1.Value, len(values))
+	for index, value := range values {
+		switch value.Kind {
+		case cdc.ValueText:
+			converted[columns[index]] = &watchv1.Value{Kind: &watchv1.Value_Text{Text: value.Text}}
+		case cdc.ValueNull:
+			converted[columns[index]] = &watchv1.Value{Kind: &watchv1.Value_Null{Null: structpb.NullValue_NULL_VALUE}}
+		case cdc.ValueUnchangedToast:
+			converted[columns[index]] = &watchv1.Value{Kind: &watchv1.Value_UnchangedToast{UnchangedToast: &emptypb.Empty{}}}
+		default:
+			// The v0 value contract has exactly these three kinds.
+			return nil, fmt.Errorf("server: column %q has unsupported value kind %s", columns[index], value.Kind)
+		}
+	}
+	return converted, nil
 }
 
 func convertRow(row map[string]any) (*watchv1.Row, error) {
@@ -287,10 +308,8 @@ func convertValues(values map[string]any) (map[string]*watchv1.Value, error) {
 			converted[column] = &watchv1.Value{Kind: &watchv1.Value_Text{Text: value}}
 		case nil:
 			converted[column] = &watchv1.Value{Kind: &watchv1.Value_Null{Null: structpb.NullValue_NULL_VALUE}}
-		case cdc.UnchangedToast:
-			converted[column] = &watchv1.Value{Kind: &watchv1.Value_UnchangedToast{UnchangedToast: &emptypb.Empty{}}}
 		default:
-			// The v0 value contract has exactly these three kinds.
+			// A snapshot row is a full read: text or NULL, never unchanged TOAST.
 			return nil, fmt.Errorf("server: column %q has unsupported value type %T", column, value)
 		}
 	}

@@ -103,7 +103,8 @@ func TestWatchTranslatesEveryEvent(t *testing.T) {
 			Operation: cdc.OperationUpdate,
 			Table:     "public.permissions",
 			Key:       map[string]string{"id": "1"},
-			Values:    map[string]any{"id": "1", "note": nil, "blob": cdc.UnchangedToast{}},
+			Columns:   []string{"id", "note", "blob"},
+			Values:    []cdc.Value{cdc.TextValue("1"), {Kind: cdc.ValueNull}, {Kind: cdc.ValueUnchangedToast}},
 		}, {
 			Operation: cdc.OperationDelete,
 			Table:     "public.permissions",

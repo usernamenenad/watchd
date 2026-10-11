@@ -125,7 +125,7 @@ func TestTypeMatrixDecodesEveryColumnAsMeasuredOutputText(t *testing.T) {
 		if change.Operation != OperationInsert {
 			t.Fatalf("operation = %s, want %s", change.Operation, OperationInsert)
 		}
-		assertRowMatchesText(t, change.Values, map[string]string{
+		assertRowMatchesText(t, changeRow(t, change), map[string]string{
 			"tenant_id":     tenantID,
 			"item_id":       updatedID,
 			"smallint_val":  "32767",                // max int16

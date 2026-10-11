@@ -105,7 +105,7 @@ func TestValueEncodingRoundTripsEveryTypeClassAsText(t *testing.T) {
 		if change.Operation != OperationInsert {
 			t.Fatalf("operation = %s, want %s", change.Operation, OperationInsert)
 		}
-		assertRowMatchesText(t, change.Values, map[string]string{
+		assertRowMatchesText(t, changeRow(t, change), map[string]string{
 			"tenant_id": tenantID,
 			"item_id":   updatedID,
 			"status":    "inactive",
@@ -119,6 +119,25 @@ func TestValueEncodingRoundTripsEveryTypeClassAsText(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for replicated transaction")
 	}
+}
+
+// changeRow returns a change's row state in the shape of a snapshot row: a
+// string for text and nil for NULL. Unchanged TOAST has no snapshot-row
+// equivalent and fails the test.
+func changeRow(t *testing.T, change Change) map[string]any {
+	t.Helper()
+	row := make(map[string]any, len(change.Columns))
+	for index, column := range change.Columns {
+		switch value := change.Values[index]; value.Kind {
+		case ValueText:
+			row[column] = value.Text
+		case ValueNull:
+			row[column] = nil
+		default:
+			t.Fatalf("column %s = %s, want text or NULL", column, value.Kind)
+		}
+	}
+	return row
 }
 
 func assertRowMatchesText(t *testing.T, row map[string]any, want map[string]string) {

@@ -76,7 +76,8 @@ func change(tenant, user string) cdc.Change {
 		Operation: cdc.OperationInsert,
 		Table:     testTable,
 		Key:       map[string]string{"tenant_id": tenant, "user_id": user},
-		Values:    map[string]any{"tenant_id": tenant, "user_id": user},
+		Columns:   []string{"tenant_id", "user_id"},
+		Values:    []cdc.Value{cdc.TextValue(tenant), cdc.TextValue(user)},
 	}
 }
 
