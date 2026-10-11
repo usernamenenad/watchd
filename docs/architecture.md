@@ -53,3 +53,5 @@ The v0 runtime is single-process soft state. On restart or an unreplayable curso
 - `sdk/go/watchd`: public Go client behavior.
 
 Types should live at the boundary that owns their meaning. Executable packages must not become shared domain libraries.
+
+For a file-by-file walkthrough of every package, its key functions, and the reasoning behind them, see [Internals](internals.md).
