@@ -96,6 +96,10 @@ const (
 	// ResyncSourceStopped: the source stream ended, for example because its
 	// replication slot was invalidated.
 	ResyncSourceStopped
+	// ResyncSchemaChanged: a projected table changed shape incompatibly (a
+	// column, its key or replica identity, its name), so its projection can
+	// no longer be kept fresh from the stream until the spec is re-validated.
+	ResyncSchemaChanged
 )
 
 func (r ResyncReason) String() string {
@@ -108,6 +112,8 @@ func (r ResyncReason) String() string {
 		return "snapshot-window-closed"
 	case ResyncSourceStopped:
 		return "source-stopped"
+	case ResyncSchemaChanged:
+		return "schema-changed"
 	default:
 		return fmt.Sprintf("ResyncReason(%d)", int(r))
 	}

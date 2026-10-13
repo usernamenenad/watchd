@@ -30,3 +30,11 @@ func NewSnapshotForTest(sourceID string, cursor uint64, xmin, xmax uint64, inPro
 func NewCursorForTest(sourceID string, lsn uint64) Cursor {
 	return Cursor{sourceID: sourceID, lsn: pglogrepl.LSN(lsn)}
 }
+
+// WithIncompatibleForTest returns t as the Reader would deliver it when the
+// projected table changed shape incompatibly, for tests in other watchd
+// packages.
+func (t Transaction) WithIncompatibleForTest(table, difference string) Transaction {
+	t.Incompatible = append(t.Incompatible[:len(t.Incompatible):len(t.Incompatible)], &IncompatibleRelationError{Table: table, Difference: difference})
+	return t
+}

@@ -55,13 +55,36 @@ When a watcher has no usable cursor, it obtains a snapshot. The snapshot and its
 
 When a watcher reconnects with a usable cursor, it may receive replayed changes beginning at or before that cursor. Changes are therefore **at-least-once** and consumers must apply them idempotently.
 
-When `watchd` cannot replay safely—for example, its bounded replay window was exceeded, it restarted, the source slot was invalidated, or the supplied cursor is unknown—it emits `Resync`. The watcher must:
+When `watchd` cannot replay safely—for example, its bounded replay window was exceeded, it restarted, the source slot was invalidated, or the supplied cursor is unknown—it emits `Resync`. Each resync carries a reason:
+
+| Reason | Meaning |
+| --- | --- |
+| `cursor_unavailable` | The resume cursor is not replayable here (restart, or the replay window moved past it). |
+| `slow_watcher` | The watcher fell further behind than its queue allows. |
+| `snapshot_window_closed` | The snapshot could not be paired with the change stream. |
+| `source_stopped` | The source stream ended. |
+| `schema_changed` | A projected table changed shape incompatibly (see below). |
+
+The watcher must:
 
 1. Mark the affected scope stale.
 2. Stop claiming freshness for that scope.
 3. Obtain a new snapshot.
 4. Replace the local projection atomically.
 5. Resume watching after the snapshot cursor.
+
+### Schema changes
+
+When a projection spec is validated against the source, `watchd` records the table's shape: the columns the publication carries with their types, the table's identity, its replica identity, and its key columns. Every `Relation` message the stream sends afterwards is compared with it. Identical shapes (for example a re-sent `Relation` after an unrelated `ALTER TABLE`, or after a reconnect) change nothing. Any difference—a column added, dropped, or retyped, a changed primary key or replica identity, or a table that was renamed, or dropped and recreated—is incompatible, and `watchd` never guesses a migration. Instead it:
+
+1. Drops the table's row changes from the stream, so a projection of the old shape never receives rows of the new one.
+2. Sends `Resync(schema_changed)` to every watcher of every scope of every projection of that table.
+3. Refuses to resume any watcher of that table from a cursor: the changes after the DDL were not delivered, and the replay window no longer reaches back across it.
+4. Accepts a new snapshot, which re-validates the spec against the table as it is now. If the table still matches its configured spec, its new shape becomes the recorded one and delivery resumes from that snapshot. If it does not (for example, the primary key changed), the watch fails with an invalid-configuration error until the spec is corrected and `watchd` is restarted.
+
+The reader also logs a structured warning naming the table and the first difference, and counts it in `watchd.cdc.relation.incompatible`. PostgreSQL sends a `Relation` only when a row of the table changes, so the change is noticed at the first write after the DDL. Resyncing is conservative: a change in flight when the shape changes may resync a watcher that is already rebuilding, which then rebuilds again.
+
+A `schema_changed` resync is handled like any other.
 
 ## Transaction and ordering rules
 

@@ -110,6 +110,7 @@ These metrics come from `internal/cdc`. Every metric describes the process's one
 | `watchd.cdc.transaction.changes` | histogram | `{change}` | | Row changes per transaction. The top bucket is `MaxTransactionChanges`. |
 | `watchd.cdc.transaction.size` | histogram | `By` | | Estimated in-memory size per transaction. The top bucket is `MaxTransactionBytes`. |
 | `watchd.cdc.decode.errors` | counter | `{error}` | | Messages that could not be decoded. |
+| `watchd.cdc.relation.incompatible` | counter | `{event}` | | Projected tables whose shape changed incompatibly (column added, dropped or retyped; key, replica identity, name or identity of the table changed). The hub resyncs the projection's watchers with `schema_changed`; the log event names the table and the difference. |
 | `watchd.cdc.sink.duration` | histogram | `s` | | Time the hub takes to accept a transaction. Replication waits for it before acknowledging, so this is watchd's backpressure point. |
 | `watchd.cdc.commit_to_accept` | histogram | `s` | | From commit in PostgreSQL to acceptance by the hub. Subject to clock skew between PostgreSQL and watchd. |
 | `watchd.cdc.slot.retained_wal` | gauge | `By` | | WAL PostgreSQL retains for the slot: its current WAL position minus the slot's `restart_lsn`. |
@@ -153,7 +154,7 @@ These metrics come from `internal/watch`. Per-watcher values are histograms samp
 | `watchd.hub.watcher.queue_depth` | histogram | `{transaction}` | | Transactions still queued for a watcher each time it takes one. Near `WatcherQueue`, the watcher is about to be dropped. |
 | `watchd.hub.watcher.lag` | histogram | `By` | | WAL between the hub's newest transaction and each transaction a watcher takes from its queue. |
 | `watchd.hub.progress` | counter | `{event}` | | Progress events sent. |
-| `watchd.hub.resyncs` | counter | `{event}` | `reason` | Watches ended with Resync: `cursor_unavailable`, `slow_watcher` (a slow-watcher disconnect), `snapshot_window_closed`, or `source_stopped`. |
+| `watchd.hub.resyncs` | counter | `{event}` | `reason` | Watches ended with Resync: `cursor_unavailable`, `slow_watcher` (a slow-watcher disconnect), `snapshot_window_closed`, `source_stopped`, or `schema_changed`. |
 
 ### Server: the gRPC API
 

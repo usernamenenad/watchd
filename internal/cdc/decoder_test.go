@@ -3,6 +3,7 @@ package cdc
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pglogrepl"
@@ -495,5 +496,161 @@ func TestDecoderRelationUpdateKeepsDecodedColumns(t *testing.T) {
 	}
 	if got := transaction.Changes[1].Columns[2]; got != "role" {
 		t.Fatalf("second change column = %q, want role", got)
+	}
+}
+
+func shapedDecoder(t *testing.T) (*Decoder, *shapes) {
+	t.Helper()
+	registry := &shapes{}
+	baseline := sampleRelation()
+	for _, column := range baseline.Columns {
+		column.DataType = 25
+	}
+	shape := shapeOfRelation(baseline)
+	registry.record(&shape)
+	decoder := NewDecoder()
+	decoder.shapes = registry
+	return decoder, registry
+}
+
+func TestDecoderResyncsOnIncompatibleRelationChange(t *testing.T) {
+	cases := map[string]struct {
+		mutate func(*pglogrepl.RelationMessage)
+		want   string
+	}{
+		"add a column": {
+			func(r *pglogrepl.RelationMessage) {
+				r.Columns = append(r.Columns, &pglogrepl.RelationMessageColumn{Name: "extra", DataType: 25})
+			},
+			`column "extra" was added`,
+		},
+		"drop a column": {
+			func(r *pglogrepl.RelationMessage) { r.Columns = r.Columns[:2] },
+			`column "permissions" was dropped`,
+		},
+		"change a type": {
+			func(r *pglogrepl.RelationMessage) { r.Columns[2].DataType = 23 },
+			`column "permissions" changed type`,
+		},
+		"change the primary key": {
+			func(r *pglogrepl.RelationMessage) { r.Columns[1].Flags = 0 },
+			"key columns changed",
+		},
+		"change the replica identity": {
+			func(r *pglogrepl.RelationMessage) { r.ReplicaIdentity = 'f' },
+			"replica identity changed",
+		},
+		"recreate the table": {
+			func(r *pglogrepl.RelationMessage) { r.RelationID = 43 },
+			"dropped and recreated",
+		},
+	}
+	for name, test := range cases {
+		t.Run(name, func(t *testing.T) {
+			decoder, _ := shapedDecoder(t)
+			changed := sampleRelation()
+			for _, column := range changed.Columns {
+				column.DataType = 25
+			}
+			test.mutate(changed)
+
+			mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+			mustConsume(t, decoder, changed)
+			mustConsume(t, decoder, &pglogrepl.InsertMessage{RelationID: changed.RelationID, Tuple: fullTuple("acme", "alice", "editor")})
+			transaction, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 1, TransactionEndLSN: 2})
+			if err != nil {
+				t.Fatalf("commit: %v", err)
+			}
+			if len(transaction.Changes) != 0 {
+				t.Fatalf("changes = %#v, want the incompatible table's changes dropped", transaction.Changes)
+			}
+			if len(transaction.Incompatible) != 1 {
+				t.Fatalf("incompatible = %v, want one", transaction.Incompatible)
+			}
+			got := transaction.Incompatible[0]
+			if !errors.Is(got, ErrIncompatibleRelation) || got.Table != "public.tenant_permissions_projection" || !strings.Contains(got.Difference, test.want) {
+				t.Fatalf("incompatible = %#v, want table public.tenant_permissions_projection and difference containing %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDecoderAcceptsAnIdenticalRelationMessage(t *testing.T) {
+	decoder, _ := shapedDecoder(t)
+	same := sampleRelation()
+	for _, column := range same.Columns {
+		column.DataType = 25
+	}
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+	mustConsume(t, decoder, same)
+	mustConsume(t, decoder, &pglogrepl.InsertMessage{RelationID: same.RelationID, Tuple: fullTuple("acme", "alice", "editor")})
+	transaction, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 1, TransactionEndLSN: 2})
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if len(transaction.Changes) != 1 || len(transaction.Incompatible) != 0 {
+		t.Fatalf("transaction = %#v, want its change delivered and nothing incompatible", transaction)
+	}
+}
+
+func TestDecoderRecoversWhenTheBaselineMoves(t *testing.T) {
+	decoder, registry := shapedDecoder(t)
+	changed := sampleRelation()
+	for _, column := range changed.Columns {
+		column.DataType = 25
+	}
+	changed.Columns = append(changed.Columns, &pglogrepl.RelationMessageColumn{Name: "extra", DataType: 25})
+	insert := &pglogrepl.InsertMessage{RelationID: changed.RelationID, Tuple: &pglogrepl.TupleData{Columns: []*pglogrepl.TupleDataColumn{
+		textColumn("acme"), textColumn("alice"), textColumn("editor"), textColumn("x"),
+	}}}
+
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+	mustConsume(t, decoder, changed)
+	mustConsume(t, decoder, insert)
+	first, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 1, TransactionEndLSN: 2})
+	if err != nil || len(first.Changes) != 0 || len(first.Incompatible) != 1 {
+		t.Fatalf("first = %#v, %v; want its change dropped and one incompatible table", first, err)
+	}
+
+	// Re-validating the spec against the new table shape accepts it, with no
+	// new Relation message from the source.
+	shape := shapeOfRelation(changed)
+	registry.record(&shape)
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+	mustConsume(t, decoder, insert)
+	second, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 3, TransactionEndLSN: 4})
+	if err != nil || len(second.Changes) != 1 || len(second.Incompatible) != 0 {
+		t.Fatalf("second = %#v, %v; want its change delivered", second, err)
+	}
+}
+
+func TestDecoderReportsARenamedTable(t *testing.T) {
+	decoder, _ := shapedDecoder(t)
+	renamed := sampleRelation()
+	for _, column := range renamed.Columns {
+		column.DataType = 25
+	}
+	renamed.RelationName = "renamed"
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+	mustConsume(t, decoder, renamed)
+	transaction, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 1, TransactionEndLSN: 2})
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if len(transaction.Incompatible) != 1 || transaction.Incompatible[0].Table != "public.tenant_permissions_projection" || !strings.Contains(transaction.Incompatible[0].Difference, "renamed to public.renamed") {
+		t.Fatalf("incompatible = %v, want the projected table reported as renamed", transaction.Incompatible)
+	}
+}
+
+func TestDecoderIgnoresTablesWithoutABaseline(t *testing.T) {
+	decoder := NewDecoder()
+	decoder.shapes = &shapes{}
+	relation := sampleRelation()
+	mustConsume(t, decoder, &pglogrepl.BeginMessage{})
+	mustConsume(t, decoder, relation)
+	mustConsume(t, decoder, &pglogrepl.InsertMessage{RelationID: relation.RelationID, Tuple: fullTuple("acme", "alice", "editor")})
+	transaction, err := decoder.Consume(&pglogrepl.CommitMessage{CommitLSN: 1, TransactionEndLSN: 2})
+	if err != nil || len(transaction.Changes) != 1 || len(transaction.Incompatible) != 0 {
+		t.Fatalf("transaction = %#v, %v; want the change delivered", transaction, err)
 	}
 }

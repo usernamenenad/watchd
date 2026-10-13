@@ -544,3 +544,51 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestIncompatibleRelationResyncsEveryScopeAndBlocksResume(t *testing.T) {
+	snapshotter := &fakeSnapshotter{snapshot: cdc.NewSnapshotForTest(testSource, 50, 1, 1)}
+	hub := newTestHub(t, snapshotter)
+	ready := []Event{SnapshotBegin{}, SnapshotRows{}, SnapshotEnd{}, Progress{Cursor: cursor(50)}}
+	a := startWatch(t, hub, Request{Projection: "permissions", Scope: tenantA})
+	a.expect(t, ready...)
+	b := startWatch(t, hub, Request{Projection: "permissions", Scope: tenantB})
+	b.expect(t, ready...)
+
+	before := transaction(100, 5, change(tenantA, "u1"))
+	accept(t, hub, before)
+	a.expect(t, batch(before, change(tenantA, "u1")), Progress{Cursor: before.Cursor})
+	b.expect(t, Progress{Cursor: before.Cursor})
+
+	changed := transaction(200, 6).WithIncompatibleForTest(testTable, `column "x" was added`)
+	accept(t, hub, changed)
+	for _, stream := range []*watchStream{a, b} {
+		stream.expect(t, Resync{Reason: ResyncSchemaChanged})
+		if err := stream.expectEnd(t); err != nil {
+			t.Fatalf("watch error = %v, want nil after Resync", err)
+		}
+	}
+
+	// A resume cannot be served: the stream dropped the table's changes.
+	startWatch(t, hub, Request{Projection: "permissions", Scope: tenantA, ResumeCursor: before.Cursor.String()}).
+		expect(t, Resync{Reason: ResyncSchemaChanged})
+
+	// A new snapshot re-validates the table and accepts its new shape; a
+	// cursor from before the change is not replayable, one after it is.
+	fresh := startWatch(t, hub, Request{Projection: "permissions", Scope: tenantA})
+	fresh.expect(t, SnapshotBegin{}, SnapshotRows{}, SnapshotEnd{}, batch(before, change(tenantA, "u1")), Progress{Cursor: changed.Cursor})
+	startWatch(t, hub, Request{Projection: "permissions", Scope: tenantA, ResumeCursor: before.Cursor.String()}).
+		expect(t, Resync{Reason: ResyncCursorUnavailable})
+	startWatch(t, hub, Request{Projection: "permissions", Scope: tenantA, ResumeCursor: changed.Cursor.String()}).
+		expect(t, Progress{Cursor: changed.Cursor})
+}
+
+func TestIncompatibleRelationLeavesOtherTablesAlone(t *testing.T) {
+	hub := newTestHub(t, &fakeSnapshotter{snapshot: cdc.NewSnapshotForTest(testSource, 50, 1, 1)})
+	stream := startWatch(t, hub, Request{Projection: "permissions", Scope: tenantA})
+	stream.expect(t, SnapshotBegin{}, SnapshotRows{}, SnapshotEnd{}, Progress{Cursor: cursor(50)})
+
+	other := transaction(200, 6).WithIncompatibleForTest("public.other", "table was renamed")
+	accept(t, hub, other)
+	stream.expect(t, Progress{Cursor: other.Cursor})
+	stream.expectSilence(t)
+}

@@ -107,6 +107,10 @@ enum ResyncReason {
   RESYNC_REASON_SNAPSHOT_WINDOW_CLOSED = 3;
   // The server's source stream ended.
   RESYNC_REASON_SOURCE_STOPPED = 4;
+  // A projected table changed shape incompatibly (a column, its key or
+  // replica identity, its name). The projection is stale until the server
+  // re-validates it, which a new snapshot request does.
+  RESYNC_REASON_SCHEMA_CHANGED = 5;
 }
 
 message Row {
