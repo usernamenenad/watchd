@@ -19,6 +19,7 @@ var resyncReasonNames = map[ResyncReason]string{
 	ResyncSlowWatcher:          "slow_watcher",
 	ResyncSnapshotWindowClosed: "snapshot_window_closed",
 	ResyncSourceStopped:        "source_stopped",
+	ResyncSchemaChanged:        "schema_changed",
 }
 
 // hubMetrics are the hub's instruments, created once in New, with their

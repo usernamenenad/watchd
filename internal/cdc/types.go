@@ -112,6 +112,11 @@ type Transaction struct {
 	// It is informational, for measuring latency: ordering always comes
 	// from Cursor.
 	CommitTime time.Time
+	// Incompatible lists projected tables whose shape in the stream stopped
+	// matching their validated spec in this transaction or since the last
+	// one. Their changes are not in Changes; the projections they feed
+	// cannot be kept fresh and their watchers must resync.
+	Incompatible []*IncompatibleRelationError
 
 	// commitLSN is the start of the transaction's commit record, which is
 	// what PostgreSQL itself compares against a replication start position.

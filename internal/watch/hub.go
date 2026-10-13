@@ -100,6 +100,10 @@ type Hub struct {
 	lastEvicted cdc.Cursor
 	hasEvicted  bool
 	watchers    map[*watcher]struct{}
+	// stale holds the tables whose shape changed incompatibly and has not
+	// been re-validated by a snapshot since. Watches resuming from a cursor
+	// are refused for them.
+	stale map[string]struct{}
 	// routes indexes watchers by the table and scope their changes come
 	// from, so Accept only visits the watchers a transaction concerns.
 	routes map[string][]*route
@@ -161,8 +165,10 @@ type watcher struct {
 	// queue receives this watcher's relevant transactions after it
 	// registers, with the changes that belong to it.
 	queue chan queued
-	// overflow is closed when the watcher's queue was full.
+	// overflow is closed when the hub ends the watcher: its queue was full,
+	// or its table changed shape. reason, set before the close, says which.
 	overflow chan struct{}
+	reason   ResyncReason
 }
 
 // New creates a hub serving cfg's projections, taking snapshots from
@@ -196,6 +202,7 @@ func New(cfg Config, snapshotter Snapshotter) (*Hub, error) {
 		maxReplay:   cfg.MaxReplayTransactions,
 		queueSize:   cfg.WatcherQueue,
 		watchers:    make(map[*watcher]struct{}),
+		stale:       make(map[string]struct{}),
 		routes:      make(map[string][]*route),
 		tick:        make(chan struct{}),
 		stopped:     make(chan struct{}),
@@ -248,6 +255,10 @@ func (h *Hub) Accept(ctx context.Context, transaction cdc.Transaction) error {
 	h.ring = append(h.ring, transaction)
 	for len(h.ring) > h.maxReplay {
 		h.evictLocked()
+	}
+
+	for _, incompatible := range transaction.Incompatible {
+		h.invalidateLocked(incompatible.Table, transaction.Cursor)
 	}
 
 	for _, change := range transaction.Changes {
@@ -359,6 +370,10 @@ func (h *Hub) Watch(ctx context.Context, req Request, send func(Event) error) er
 // snapshot, but only works while the ring still reaches back to cursor.
 func (h *Hub) resume(ctx context.Context, w *watcher, cursor cdc.Cursor, send func(Event) error) error {
 	h.mu.Lock()
+	if _, stale := h.stale[w.projection.table]; stale {
+		h.mu.Unlock()
+		return send(Resync{Reason: ResyncSchemaChanged})
+	}
 	if !h.replayableLocked(cursor) {
 		h.mu.Unlock()
 		return send(Resync{Reason: ResyncCursorUnavailable})
@@ -431,9 +446,16 @@ func (h *Hub) snapshot(ctx context.Context, w *watcher, send func(Event) error) 
 	// them: it would have to discard them again straight away.
 	select {
 	case <-w.overflow:
-		return send(Resync{Reason: ResyncSlowWatcher})
+		return send(Resync{Reason: w.reason})
 	default:
 	}
+	// The watcher registered after any shape change it has not been told
+	// about, so its snapshot validated the spec against the table as it is
+	// now, which accepts that shape. One ended by a change registered before
+	// it, and may have validated the old shape: it proves nothing.
+	h.mu.Lock()
+	delete(h.stale, w.projection.table)
+	h.mu.Unlock()
 
 	notCovered := func(transaction cdc.Transaction) (bool, error) {
 		covered, err := snapshot.Covers(transaction)
@@ -519,7 +541,7 @@ func (h *Hub) live(ctx context.Context, w *watcher, base cdc.Cursor, baseSafe bo
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-w.overflow:
-			return send(Resync{Reason: ResyncSlowWatcher})
+			return send(Resync{Reason: w.reason})
 		case <-h.stopped:
 			return send(Resync{Reason: ResyncSourceStopped})
 		case <-tick:
@@ -597,6 +619,26 @@ func (h *Hub) routeLocked(p projection) *route {
 	return r
 }
 
+// invalidateLocked handles table changing shape incompatibly in the
+// transaction ending at cursor: every watcher of the table is resynced, and
+// resuming is refused until a snapshot re-validates it. The transaction's
+// changes to the table were dropped, so the ring cannot replay across it
+// either: the replay floor moves to it, for every table.
+func (h *Hub) invalidateLocked(table string, cursor cdc.Cursor) {
+	h.stale[table] = struct{}{}
+	for w := range h.watchers {
+		if w.projection.table == table {
+			h.endLocked(w, ResyncSchemaChanged)
+		}
+	}
+	if h.hasFloor && later(cursor, h.floor) {
+		h.floor = cursor
+	}
+	if !h.hasEvicted || later(cursor, h.lastEvicted) {
+		h.lastEvicted, h.hasEvicted = cursor, true
+	}
+}
+
 // removeLocked removes w from the watchers Accept delivers to, and reports
 // whether it was still registered.
 func (h *Hub) removeLocked(w *watcher) bool {
@@ -615,7 +657,13 @@ func (h *Hub) removeLocked(w *watcher) bool {
 }
 
 func (h *Hub) dropLocked(w *watcher) {
+	h.endLocked(w, ResyncSlowWatcher)
+}
+
+// endLocked removes w and ends its watch with Resync(reason).
+func (h *Hub) endLocked(w *watcher, reason ResyncReason) {
 	if h.removeLocked(w) {
+		w.reason = reason
 		close(w.overflow)
 	}
 }

@@ -60,6 +60,7 @@ type Reader struct {
 	inFlightChanges      atomic.Int64
 	inFlightBytes        atomic.Int64
 	metrics              *readerMetrics
+	shapes               shapes
 
 	bootstrapMu     sync.Mutex
 	bootstrapStream *CDC

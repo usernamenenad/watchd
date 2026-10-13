@@ -87,7 +87,7 @@ func (r *Reader) read(ctx context.Context) error {
 	if stream, startLSN, ok := r.takeBootstrapStream(); ok {
 		defer r.closeReplicationConnection(stream)
 		r.setConnectionState(stateStreaming)
-		decoder := NewDecoderWithLimits(r.config.MaxTransactionBytes, r.config.MaxTransactionChanges, r.config.MaxValueBytes)
+		decoder := r.newDecoder()
 		return r.receive(ctx, stream.Conn(), decoder, startLSN)
 	}
 
@@ -109,8 +109,26 @@ func (r *Reader) read(ctx context.Context) error {
 
 	r.log(ctx, slog.LevelInfo, "PostgreSQL logical replication started", "slot", r.config.SlotName, "start_lsn", startLSN.String())
 	r.setConnectionState(stateStreaming)
-	decoder := NewDecoderWithLimits(r.config.MaxTransactionBytes, r.config.MaxTransactionChanges, r.config.MaxValueBytes)
+	decoder := r.newDecoder()
 	return r.receive(ctx, conn, decoder, startLSN)
+}
+
+// newDecoder returns a decoder that checks relations against the baselines
+// of every projection validated so far. Baselines outlive a decoder, so a
+// reconnect does not forget what a spec was validated against.
+func (r *Reader) newDecoder() *Decoder {
+	decoder := NewDecoderWithLimits(r.config.MaxTransactionBytes, r.config.MaxTransactionChanges, r.config.MaxValueBytes)
+	decoder.shapes = &r.shapes
+	return decoder
+}
+
+// reportIncompatible logs and counts each projected table that changed
+// shape. The hub, as the sink, resyncs the table's watchers.
+func (r *Reader) reportIncompatible(ctx context.Context, events []*IncompatibleRelationError) {
+	for _, event := range events {
+		r.metrics.incompatible.Add(ctx, 1)
+		r.log(ctx, slog.LevelWarn, "projected table changed incompatibly; its watchers must resync", "table", event.Table, "difference", event.Difference)
+	}
 }
 
 func (r *Reader) startReplication(ctx context.Context, conn *pgconn.PgConn, startLSN pglogrepl.LSN) error {
@@ -253,6 +271,7 @@ func (r *Reader) consumeCopyData(
 			return fmt.Errorf("%w: decoder emitted a transaction without a commit end LSN", ErrMalformedReplicationData)
 		}
 		r.incrementTransactionsReceived()
+		r.reportIncompatible(ctx, transaction.Incompatible)
 		transaction.Cursor.sourceID = r.config.SourceID
 
 		decoded := r.now()

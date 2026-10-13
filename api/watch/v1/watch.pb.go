@@ -41,6 +41,10 @@ const (
 	ResyncReason_RESYNC_REASON_SNAPSHOT_WINDOW_CLOSED ResyncReason = 3
 	// The server's source stream ended.
 	ResyncReason_RESYNC_REASON_SOURCE_STOPPED ResyncReason = 4
+	// A projected table changed shape incompatibly (a column, its key or
+	// replica identity, its name). The projection is stale until the server
+	// re-validates it, which a new snapshot request does.
+	ResyncReason_RESYNC_REASON_SCHEMA_CHANGED ResyncReason = 5
 )
 
 // Enum value maps for ResyncReason.
@@ -51,6 +55,7 @@ var (
 		2: "RESYNC_REASON_SLOW_WATCHER",
 		3: "RESYNC_REASON_SNAPSHOT_WINDOW_CLOSED",
 		4: "RESYNC_REASON_SOURCE_STOPPED",
+		5: "RESYNC_REASON_SCHEMA_CHANGED",
 	}
 	ResyncReason_value = map[string]int32{
 		"RESYNC_REASON_UNSPECIFIED":            0,
@@ -58,6 +63,7 @@ var (
 		"RESYNC_REASON_SLOW_WATCHER":           2,
 		"RESYNC_REASON_SNAPSHOT_WINDOW_CLOSED": 3,
 		"RESYNC_REASON_SOURCE_STOPPED":         4,
+		"RESYNC_REASON_SCHEMA_CHANGED":         5,
 	}
 )
 
@@ -1061,13 +1067,14 @@ const file_api_watch_v1_watch_proto_rawDesc = "" +
 	"\x04left\x18\x01 \x01(\tR\x04left\x12\x14\n" +
 	"\x05right\x18\x02 \x01(\tR\x05right\"E\n" +
 	"\x16CompareCursorsResponse\x12+\n" +
-	"\x05order\x18\x01 \x01(\x0e2\x15.watch.v1.CursorOrderR\x05order*\xbf\x01\n" +
+	"\x05order\x18\x01 \x01(\x0e2\x15.watch.v1.CursorOrderR\x05order*\xe1\x01\n" +
 	"\fResyncReason\x12\x1d\n" +
 	"\x19RESYNC_REASON_UNSPECIFIED\x10\x00\x12$\n" +
 	" RESYNC_REASON_CURSOR_UNAVAILABLE\x10\x01\x12\x1e\n" +
 	"\x1aRESYNC_REASON_SLOW_WATCHER\x10\x02\x12(\n" +
 	"$RESYNC_REASON_SNAPSHOT_WINDOW_CLOSED\x10\x03\x12 \n" +
-	"\x1cRESYNC_REASON_SOURCE_STOPPED\x10\x04*h\n" +
+	"\x1cRESYNC_REASON_SOURCE_STOPPED\x10\x04\x12 \n" +
+	"\x1cRESYNC_REASON_SCHEMA_CHANGED\x10\x05*h\n" +
 	"\tOperation\x12\x19\n" +
 	"\x15OPERATION_UNSPECIFIED\x10\x00\x12\x14\n" +
 	"\x10OPERATION_INSERT\x10\x01\x12\x14\n" +

@@ -66,6 +66,11 @@ type Decoder struct {
 	maxTransactionBytes   int
 	maxTransactionChanges int
 	maxValueBytes         int
+
+	// shapes, when set, holds the baselines relations are checked against.
+	// events are the incompatible relations found since the last COMMIT.
+	shapes shapeRegistry
+	events []*IncompatibleRelationError
 }
 
 // relationInfo is what row decoding needs from a RelationMessage, derived
@@ -78,12 +83,22 @@ type relationInfo struct {
 	columns []string
 	// keyIndexes are the positions of the replica-identity columns.
 	keyIndexes []int
+
+	// shape is the relation as the stream presented it. checked is the
+	// shapeRegistry generation incompatible was decided at; incompatible is
+	// non-nil while the relation disagrees with its baseline.
+	shape        relationShape
+	oid          uint32
+	checked      uint64
+	incompatible *IncompatibleRelationError
 }
 
 func newRelationInfo(relation *pglogrepl.RelationMessage) *relationInfo {
 	info := &relationInfo{
 		table:   qualifiedTable(relation.Namespace, relation.RelationName),
 		columns: make([]string, len(relation.Columns)),
+		shape:   shapeOfRelation(relation),
+		oid:     relation.RelationID,
 	}
 	for index, column := range relation.Columns {
 		info.columns[index] = column.Name
@@ -129,7 +144,9 @@ func NewDecoderWithLimits(maxTransactionBytes, maxTransactionChanges, maxValueBy
 func (d *Decoder) Consume(message pglogrepl.Message) (*Transaction, error) {
 	switch message := message.(type) {
 	case *pglogrepl.RelationMessage:
-		d.relations[message.RelationID] = newRelationInfo(message)
+		info := newRelationInfo(message)
+		d.relations[message.RelationID] = info
+		d.check(info)
 		return nil, nil
 
 	case *pglogrepl.BeginMessage:
@@ -145,6 +162,9 @@ func (d *Decoder) Consume(message pglogrepl.Message) (*Transaction, error) {
 		return nil, nil
 
 	case *pglogrepl.InsertMessage:
+		if skip, err := d.skip(message.RelationID); skip || err != nil {
+			return nil, err
+		}
 		change, err := d.insert(message)
 		if err != nil {
 			return nil, err
@@ -152,6 +172,9 @@ func (d *Decoder) Consume(message pglogrepl.Message) (*Transaction, error) {
 		return nil, d.append(change)
 
 	case *pglogrepl.UpdateMessage:
+		if skip, err := d.skip(message.RelationID); skip || err != nil {
+			return nil, err
+		}
 		change, err := d.update(message)
 		if err != nil {
 			return nil, err
@@ -159,6 +182,9 @@ func (d *Decoder) Consume(message pglogrepl.Message) (*Transaction, error) {
 		return nil, d.append(change)
 
 	case *pglogrepl.DeleteMessage:
+		if skip, err := d.skip(message.RelationID); skip || err != nil {
+			return nil, err
+		}
 		change, err := d.delete(message)
 		if err != nil {
 			return nil, err
@@ -185,6 +211,8 @@ func (d *Decoder) Consume(message pglogrepl.Message) (*Transaction, error) {
 			commitLSN:  message.CommitLSN,
 			xid:        d.pendingXid,
 		}
+		transaction.Incompatible = d.events
+		d.events = nil
 		d.pending = nil
 		d.pendingBytes = 0
 		return transaction, nil
@@ -199,6 +227,59 @@ func (d *Decoder) Consume(message pglogrepl.Message) (*Transaction, error) {
 		// messages. Either could leave a projection incorrect.
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedPGOutputMessage, message.Type())
 	}
+}
+
+// check compares info with the baselines of validated projection tables and
+// records an event for each incompatibility. A relation that disagrees with
+// its baseline has its row changes dropped until a re-validation moves the
+// baseline (see skip), rather than applied against a projection of another
+// shape.
+func (d *Decoder) check(info *relationInfo) {
+	if d.shapes == nil {
+		return
+	}
+	// The generation is read first: a baseline recorded meanwhile makes the
+	// next check run again.
+	info.checked = d.shapes.generation()
+	info.incompatible = nil
+
+	// A baseline under another name with this relation ID is a rename: the
+	// projection's table is no longer the one this stream names.
+	if renamed := d.shapes.baselineByOID(info.oid); renamed != nil && renamed.table != info.table {
+		d.report(&IncompatibleRelationError{Table: renamed.table, Difference: fmt.Sprintf("table was renamed to %s", info.table)})
+	}
+	baseline := d.shapes.baselineByTable(info.table)
+	if baseline == nil {
+		return
+	}
+	if difference := baseline.diff(&info.shape); difference != "" {
+		info.incompatible = &IncompatibleRelationError{Table: info.table, Difference: difference}
+		d.report(info.incompatible)
+	}
+}
+
+func (d *Decoder) report(event *IncompatibleRelationError) {
+	for _, existing := range d.events {
+		if existing.Table == event.Table {
+			return
+		}
+	}
+	d.events = append(d.events, event)
+}
+
+// skip reports whether a row change of relation id must be dropped because
+// the relation is incompatible with its validated baseline. A baseline moved
+// by a re-validation since the last check is taken into account first.
+func (d *Decoder) skip(id uint32) (bool, error) {
+	info, err := d.relation(id)
+	if err != nil {
+		return false, err
+	}
+	if d.shapes != nil && info.checked != d.shapes.generation() {
+		d.check(info)
+	}
+
+	return info.incompatible != nil, nil
 }
 
 func (d *Decoder) append(change Change) error {

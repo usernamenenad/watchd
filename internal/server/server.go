@@ -292,6 +292,7 @@ var resyncReasons = map[watch.ResyncReason]watchv1.ResyncReason{
 	watch.ResyncSlowWatcher:          watchv1.ResyncReason_RESYNC_REASON_SLOW_WATCHER,
 	watch.ResyncSnapshotWindowClosed: watchv1.ResyncReason_RESYNC_REASON_SNAPSHOT_WINDOW_CLOSED,
 	watch.ResyncSourceStopped:        watchv1.ResyncReason_RESYNC_REASON_SOURCE_STOPPED,
+	watch.ResyncSchemaChanged:        watchv1.ResyncReason_RESYNC_REASON_SCHEMA_CHANGED,
 }
 
 var operations = map[string]watchv1.Operation{

@@ -96,6 +96,7 @@ type readerMetrics struct {
 	txChanges    metric.Int64Histogram
 	txBytes      metric.Int64Histogram
 	decodeErrors metric.Int64Counter
+	incompatible metric.Int64Counter
 	sinkDuration metric.Float64Histogram
 	commitToSink metric.Float64Histogram
 	// Messages and bytes since the last commit, and when the pending
@@ -233,6 +234,9 @@ func newReaderMetrics(meter metric.Meter, config ReaderConfig) (*readerMetrics, 
 	check(err)
 	m.decodeErrors, err = meter.Int64Counter("watchd.cdc.decode.errors", metric.WithUnit("{error}"),
 		metric.WithDescription("pgoutput messages that could not be decoded."))
+	check(err)
+	m.incompatible, err = meter.Int64Counter("watchd.cdc.relation.incompatible", metric.WithUnit("{event}"),
+		metric.WithDescription("Projected tables whose shape changed incompatibly in the stream. Each makes the hub resync that projection's watchers; the table and difference are in the log."))
 	check(err)
 	m.sinkDuration, err = meter.Float64Histogram("watchd.cdc.sink.duration", metric.WithUnit("s"),
 		metric.WithDescription("Time the sink (the hub) takes to accept a transaction. Replication waits for it before acknowledging."),

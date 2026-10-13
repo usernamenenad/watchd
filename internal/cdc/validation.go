@@ -83,6 +83,14 @@ func (r *Reader) validateProjectionSpec(ctx context.Context, management *pgx.Con
 		return fmt.Errorf("%w: publication %q does not include projection table %q.%q", ErrInvalidReaderConfig, r.config.PublicationName, spec.Schema, spec.Table)
 	}
 
+	// The table's shape now is what the stream must keep presenting; this is
+	// also what accepts a changed shape after an incompatible relation.
+	shape, err := r.projectionShape(ctx, management, spec)
+	if err != nil {
+		return err
+	}
+	r.shapes.record(shape)
+
 	return nil
 }
 
